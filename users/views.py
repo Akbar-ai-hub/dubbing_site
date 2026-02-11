@@ -1,3 +1,5 @@
+import os
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -18,7 +20,7 @@ from .utils import generate_reset_code, send_reset_code
 
 User = get_user_model()
 
-GOOGLE_CLIENT_ID = "467869356298-g702eihj4n83v6dm8331fvpve3mi7i2t.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 
 # JWT функциясы: юзерге токен генерациялайды
@@ -75,6 +77,11 @@ class LoginView(APIView):
 class GoogleLoginView(APIView):
     def post(self, request):
         token = request.data.get("token")
+        if not GOOGLE_CLIENT_ID:
+            return Response(
+                {"error": "GOOGLE_CLIENT_ID is not configured"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         try:
             google_user = id_token.verify_oauth2_token(

@@ -10,22 +10,66 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def load_env_file(file_path):
+    if not file_path.exists():
+        return
+
+    for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+def env(name, default=None):
+    return os.environ.get(name, default)
+
+
+def env_bool(name, default=False):
+    value = env(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name, default=0):
+    value = env(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def env_list(name, default=None):
+    value = env(name)
+    if value is None or value.strip() == "":
+        return default or []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+load_env_file(BASE_DIR / ".env")
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure--^m!)5ayj_t&69bsft^ri@#eo#85rdaa-pmmphq&w@p5*ewcnq'
+SECRET_KEY = env("DJANGO_SECRET_KEY", "django-insecure-change-me-in-env")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = env_bool("DJANGO_DEBUG", False)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", [])
 
 
 # Application definition
@@ -82,7 +126,7 @@ WSGI_APPLICATION = 'dubbing_site.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': BASE_DIR / env("DJANGO_DB_NAME", "db.sqlite3"),
     }
 }
 
@@ -131,7 +175,7 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = env_bool("CORS_ALLOW_ALL_ORIGINS", True)
 
 AUTH_USER_MODEL = 'users.User'
 
@@ -142,8 +186,8 @@ REST_FRAMEWORK = {
 }
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'ilhomulyakbar@gmail.com'
-EMAIL_HOST_PASSWORD = 'xgto jcgn oolr asgd'
+EMAIL_HOST = env("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = env_int("EMAIL_PORT", 587)
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
