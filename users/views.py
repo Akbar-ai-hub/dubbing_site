@@ -1,29 +1,29 @@
 import os
-
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.contrib.auth import authenticate
-from rest_framework_simplejwt.tokens import RefreshToken
-
-from google.oauth2 import id_token
-from google.auth.transport import requests
-
-from .models import User
-from .serializers import RegisterSerializer
-from django.contrib.auth import get_user_model
-from django.utils import timezone
 from datetime import timedelta
 
+from django.contrib.auth import authenticate, get_user_model
+from django.utils import timezone
+from google.auth.transport import requests
+from google.oauth2 import id_token
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken, TokenError
+
 from .models import PasswordResetCode
+from .serializers import RegisterSerializer
+from .throttles import (
+    PasswordResetCompleteThrottle,
+    PasswordResetRequestThrottle,
+    PasswordResetVerifyThrottle,
+)
 from .utils import generate_reset_code, send_reset_code
 
 User = get_user_model()
-
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 
-# JWT функциясы: юзерге токен генерациялайды
 def get_tokens_for_user(user):
     refresh = RefreshToken.for_user(user)
     return {
@@ -39,16 +39,20 @@ class RegisterView(APIView):
             user = serializer.save()
             tokens = get_tokens_for_user(user)
 
-            return Response({
-                "message": "Тіркелу сәтті аяқталды!",
-                "user": {
-                    "username": user.username,
-                    "email": user.email
+            return Response(
+                {
+                    "message": "Registration completed successfully",
+                    "user": {
+                        "username": user.username,
+                        "email": user.email,
+                    },
+                    "tokens": tokens,
                 },
-                "tokens": tokens
-            }, status=status.HTTP_201_CREATED)
+                status=status.HTTP_201_CREATED,
+            )
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
 class LoginView(APIView):
     def post(self, request):
@@ -56,23 +60,31 @@ class LoginView(APIView):
         password = request.data.get("password")
 
         if not email or not password:
-            return Response({"error": "Email және пароль керек"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email and password are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user = authenticate(request, email=email, password=password)
-
         if user is None:
-            return Response({"error": "Email немесе пароль қате"}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"error": "Invalid email or password"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         tokens = get_tokens_for_user(user)
-
-        return Response({
-            "message": "Сәтті кірдіңіз!",
-            "user": {
-                "username": user.username,
-                "email": user.email,
+        return Response(
+            {
+                "message": "Login successful",
+                "user": {
+                    "username": user.username,
+                    "email": user.email,
+                },
+                "tokens": tokens,
             },
-            "tokens": tokens
-        }, status=status.HTTP_200_OK)
+            status=status.HTTP_200_OK,
+        )
+
 
 class GoogleLoginView(APIView):
     def post(self, request):
@@ -87,117 +99,136 @@ class GoogleLoginView(APIView):
             google_user = id_token.verify_oauth2_token(
                 token, requests.Request(), GOOGLE_CLIENT_ID
             )
-        except:
-            return Response({"error": "Google token дұрыс емес"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            return Response({"error": "Invalid Google token"}, status=status.HTTP_400_BAD_REQUEST)
 
         email = google_user.get("email")
-        username = google_user.get("name")
+        username = google_user.get("name") or email.split("@")[0]
 
-        # Егер юзер бұрын жасалмаса, автоматты түрде жасаймыз
-        user, created = User.objects.get_or_create(
+        user, _ = User.objects.get_or_create(
             email=email,
-            defaults={"username": username}
+            defaults={"username": username},
         )
 
         tokens = get_tokens_for_user(user)
-
-        return Response({
-            "message": "Google арқылы сәтті кірдіңіз!",
-            "user": {
-                "username": user.username,
-                "email": user.email
+        return Response(
+            {
+                "message": "Google login successful",
+                "user": {
+                    "username": user.username,
+                    "email": user.email,
+                },
+                "tokens": tokens,
             },
-            "tokens": tokens
-        })
+            status=status.HTTP_200_OK,
+        )
 
-
-
-# ------------------------------
-# 1) Email-ге код жіберу
-# ------------------------------
 
 class PasswordResetRequestView(APIView):
+    throttle_classes = [PasswordResetRequestThrottle]
+
     def post(self, request):
         email = request.data.get("email")
-
         if not email:
-            return Response({"error": "Email енгізіңіз"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
+        # Always return the same response to prevent email enumeration.
         try:
             user = User.objects.get(email=email)
+            code = generate_reset_code()
+            PasswordResetCode.objects.create(user=user, code=code)
+            send_reset_code(email, code)
         except User.DoesNotExist:
-            return Response({"error": "Мұндай email табылмады"}, status=status.HTTP_404_NOT_FOUND)
+            pass
 
-        # код генерациялау
-        code = generate_reset_code()
+        return Response(
+            {"message": "If this email exists, a reset code was sent"},
+            status=status.HTTP_200_OK,
+        )
 
-        # базаға сақтау
-        PasswordResetCode.objects.create(user=user, code=code)
-
-        # email-ге жіберу
-        send_reset_code(email, code)
-
-        return Response({"message": "Код email-ге жіберілді"}, status=status.HTTP_200_OK)
-
-
-# ------------------------------
-# 2) Кодты тексеру
-# ------------------------------
 
 class PasswordResetVerifyView(APIView):
+    throttle_classes = [PasswordResetVerifyThrottle]
+
     def post(self, request):
         email = request.data.get("email")
         code = request.data.get("code")
 
         if not email or not code:
-            return Response({"error": "Email және код керек"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email and code are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            return Response({"error": "Email табылмады"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Email not found"}, status=status.HTTP_404_NOT_FOUND)
 
         try:
             reset_code = PasswordResetCode.objects.filter(user=user, code=code).latest("created_at")
         except PasswordResetCode.DoesNotExist:
-            return Response({"error": "Код дұрыс емес"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Invalid code"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Код 10 минутқа жарамды
         if reset_code.created_at < timezone.now() - timedelta(minutes=10):
-            return Response({"error": "Кодтың уақыты біткен"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Code has expired"}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({"message": "Код дұрыс"}, status=status.HTTP_200_OK)
+        return Response({"message": "Code is valid"}, status=status.HTTP_200_OK)
 
-
-# ------------------------------
-# 3) Жаңа пароль орнату
-# ------------------------------
 
 class PasswordResetCompleteView(APIView):
+    throttle_classes = [PasswordResetCompleteThrottle]
+
     def post(self, request):
         email = request.data.get("email")
         code = request.data.get("code")
         new_password = request.data.get("new_password")
 
         if not email or not code or not new_password:
-            return Response({"error": "Барлық өрістерді толтырыңыз"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Email, code and new_password are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            return Response({"error": "Email табылмады"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Email not found"}, status=status.HTTP_404_NOT_FOUND)
 
         try:
             reset_code = PasswordResetCode.objects.filter(user=user, code=code).latest("created_at")
         except PasswordResetCode.DoesNotExist:
-            return Response({"error": "Код дұрыс емес"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Invalid code"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Кодтың жарамдылық уақыты
         if reset_code.created_at < timezone.now() - timedelta(minutes=10):
-            return Response({"error": "Кодтың уақыты біткен"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Code has expired"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Пароль жаңарту
         user.set_password(new_password)
         user.save()
+        return Response({"message": "Password updated successfully"}, status=status.HTTP_200_OK)
 
-        return Response({"message": "Пароль сәтті жаңартылды!"}, status=status.HTTP_200_OK)
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        refresh_token = request.data.get("refresh")
+        if not refresh_token:
+            return Response(
+                {"error": "Refresh token is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+        except TokenError:
+            return Response(
+                {"error": "Invalid or expired refresh token"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)

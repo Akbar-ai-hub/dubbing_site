@@ -10,8 +10,10 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
+from datetime import timedelta
 import os
 from pathlib import Path
+from celery.schedules import crontab
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -81,6 +83,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework_simplejwt.token_blacklist',
     'rest_framework',
     'corsheaders',
     'users',
@@ -104,7 +107,7 @@ ROOT_URLCONF = 'dubbing_site.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / "templates"],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -149,6 +152,13 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(days=1),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": True,
+}
+
 
 # Internationalization
 # https://docs.djangoproject.com/en/4.2/topics/i18n/
@@ -165,7 +175,9 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = "/static/"
+STATICFILES_DIRS = [BASE_DIR / "static"]   
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
@@ -191,3 +203,31 @@ EMAIL_PORT = env_int("EMAIL_PORT", 587)
 EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
+
+# Celery
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+
+VIDEO_RETENTION_DAYS = env_int("VIDEO_RETENTION_DAYS", 7)
+
+# Dubbing pipeline
+FFMPEG_BIN = env("FFMPEG_BIN", "ffmpeg")
+WHISPER_MODEL_NAME = env("WHISPER_MODEL_NAME", "base")
+HF_TRANSLATION_MODEL_NAME = env(
+    "HF_TRANSLATION_MODEL_NAME", "Helsinki-NLP/opus-mt-en-ru"
+)
+COQUI_TTS_MODEL_NAME = env(
+    "COQUI_TTS_MODEL_NAME", "tts_models/en/ljspeech/tacotron2-DDC"
+)
+DUBBING_SOURCE_LANGUAGE = env("DUBBING_SOURCE_LANGUAGE", "")
+
+CELERY_BEAT_SCHEDULE = {
+    "delete-expired-videos-daily": {
+        "task": "videos.tasks.delete_expired_videos",
+        "schedule": crontab(hour=3, minute=0),
+    },
+}
