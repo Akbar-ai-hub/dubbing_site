@@ -6,7 +6,6 @@ from rest_framework.views import APIView
 
 from .models import Video
 from .serializers import VideoSerializer
-from .services.validators import validate_video_file
 
 
 # ---------------------------
@@ -25,19 +24,15 @@ class VideoUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            validate_video_file(file)
-        except ValueError as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = VideoSerializer(data={"original_video": file}, context={"request": request})
+        serializer.is_valid(raise_exception=True)
 
-        video = Video.objects.create(
+        video = serializer.save(
             user=request.user,
-            original_video=file,
             status=Video.STATUS_UPLOADED,
         )
 
-        serializer = VideoSerializer(video)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(VideoSerializer(video).data, status=status.HTTP_201_CREATED)
 
 
 # ---------------------------

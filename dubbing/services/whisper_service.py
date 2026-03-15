@@ -1,32 +1,68 @@
+import requests
+
+
 class WhisperService:
-    def __init__(self, model_name="base"):
+    def __init__(
+        self,
+        model_name="whisper-large-v3",
+        api_key="",
+        base_url="https://api.groq.com/openai/v1/audio/transcriptions",
+        timeout_sec=180,
+    ):
         self.model_name = model_name
-        self._model = None
+        self.api_key = api_key
+        self.base_url = base_url
+        self.timeout_sec = int(timeout_sec)
 
     def transcribe(self, audio_path, language=None):
-        model = self._get_model()
-        kwargs = {}
-        if language:
-            kwargs["language"] = language
+        if not self.api_key:
+            raise RuntimeError("GROQ_API_KEY is not configured")
 
-        result = model.transcribe(audio_path, **kwargs)
-        text = (result.get("text") or "").strip()
-        detected_language = result.get("language")
+        data = {"model": self.model_name, "response_format": "verbose_json"}
+        if language:
+            data["language"] = language
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        with open(audio_path, "rb") as audio_file:
+            files = {"file": (audio_path, audio_file, "audio/wav")}
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                data=data,
+                files=files,
+                timeout=self.timeout_sec,
+            )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Groq ASR request failed: {response.status_code} {response.text}"
+            )
+
+        payload = response.json()
         return {
-            "text": text,
-            "language": detected_language,
+            "text": (payload.get("text") or "").strip(),
+            "language": (payload.get("language") or language or "").strip() or language,
+            "segments": self._normalize_segments(payload.get("segments")),
         }
 
-    def _get_model(self):
-        if self._model is not None:
-            return self._model
+    def _normalize_segments(self, raw_segments):
+        if not isinstance(raw_segments, list):
+            return []
 
-        try:
-            import whisper
-        except ImportError as exc:
-            raise RuntimeError(
-                "whisper package is not installed. Install with: pip install openai-whisper"
-            ) from exc
+        normalized = []
+        for seg in raw_segments:
+            if not isinstance(seg, dict):
+                continue
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            normalized.append({"start": start, "end": end, "text": text})
 
-        self._model = whisper.load_model(self.model_name)
-        return self._model
+        return sorted(normalized, key=lambda item: item["start"])

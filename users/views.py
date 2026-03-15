@@ -14,9 +14,11 @@ from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 from .models import PasswordResetCode
 from .serializers import RegisterSerializer
 from .throttles import (
+    LoginThrottle,
     PasswordResetCompleteThrottle,
     PasswordResetRequestThrottle,
     PasswordResetVerifyThrottle,
+    RegisterThrottle,
 )
 from .utils import generate_reset_code, send_reset_code
 
@@ -33,6 +35,8 @@ def get_tokens_for_user(user):
 
 
 class RegisterView(APIView):
+    throttle_classes = [RegisterThrottle]
+
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         if serializer.is_valid():
@@ -55,6 +59,8 @@ class RegisterView(APIView):
 
 
 class LoginView(APIView):
+    throttle_classes = [LoginThrottle]
+
     def post(self, request):
         email = request.data.get("email")
         password = request.data.get("password")

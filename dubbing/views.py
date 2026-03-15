@@ -34,7 +34,17 @@ class StartDubbingView(APIView):
         video.error_message = ""
         video.save(update_fields=["status", "error_message"])
 
-        task = process_video_dubbing.delay(video.id)
+        try:
+            task = process_video_dubbing.delay(video.id)
+        except Exception as exc:
+            video.status = Video.STATUS_FAILED
+            video.error_message = f"Failed to enqueue dubbing task: {exc}"
+            video.save(update_fields=["status", "error_message"])
+            return Response(
+                {"error": "Failed to start dubbing task"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         return Response(
             {
                 "message": "Dubbing started",
