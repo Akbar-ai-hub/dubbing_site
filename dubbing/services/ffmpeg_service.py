@@ -158,6 +158,23 @@ class FFmpegService:
         ]
         self._run(command, "Failed to denoise audio")
 
+    def resample_audio(self, input_audio_path, output_audio_path, sample_rate_hz=22050):
+        sample_rate_hz = int(sample_rate_hz)
+        command = [
+            self.ffmpeg_bin,
+            "-y",
+            "-i",
+            input_audio_path,
+            "-ar",
+            str(sample_rate_hz),
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            output_audio_path,
+        ]
+        self._run(command, "Failed to resample audio")
+
     def mix_segments_on_timeline(self, segments, output_audio_path, total_duration_sec):
         if not segments:
             command = [
@@ -209,6 +226,29 @@ class FFmpegService:
             ]
         )
         self._run(command, "Failed to mix timeline segments")
+
+    def mix_with_background(self, foreground_audio_path, background_audio_path, output_audio_path, bg_gain_db=-20):
+        bg_gain_db = float(bg_gain_db)
+        command = [
+            self.ffmpeg_bin,
+            "-y",
+            "-i",
+            foreground_audio_path,
+            "-i",
+            background_audio_path,
+            "-filter_complex",
+            f"[1:a]volume={bg_gain_db}dB[bg];[0:a][bg]amix=inputs=2:normalize=0[mix]",
+            "-map",
+            "[mix]",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            output_audio_path,
+        ]
+        self._run(command, "Failed to mix background audio")
 
     def concat_audio_files(self, input_audio_paths, output_audio_path):
         paths = [str(p) for p in (input_audio_paths or []) if p]

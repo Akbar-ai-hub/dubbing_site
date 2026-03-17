@@ -22,6 +22,9 @@ def delete_expired_videos():
         if video.dubbed_video:
             video.dubbed_video.delete(save=False)
 
+        if video.subtitle_srt:
+            video.subtitle_srt.delete(save=False)
+
         video.delete()
         deleted_count += 1
 

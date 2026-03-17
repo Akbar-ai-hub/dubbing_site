@@ -84,6 +84,9 @@ class VideoDeleteView(APIView):
         if video.dubbed_video:
             video.dubbed_video.delete(save=False)
 
+        if video.subtitle_srt:
+            video.subtitle_srt.delete(save=False)
+
         video.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 

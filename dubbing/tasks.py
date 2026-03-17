@@ -72,6 +72,8 @@ def process_video_dubbing(video_id):
         speaker_embedding_device = _get_setting("SPEAKER_EMBEDDING_DEVICE", "")
         source_language = _get_setting("DUBBING_SOURCE_LANGUAGE", None)
 
+        subtitle_basename = f"dubbed_{video.id}_{Path(original_name).stem}.srt"
+
         pipeline = DubbingPipelineService(
             ffmpeg_bin=ffmpeg_bin,
             whisper_model_name=whisper_model,
@@ -95,6 +97,7 @@ def process_video_dubbing(video_id):
             speaker_embedding_cache_dir=(speaker_embedding_cache_dir or None),
             speaker_embedding_device=(speaker_embedding_device or None),
             ref_audio_output_dir=str(Path(settings.MEDIA_ROOT) / "dubbed_videos"),
+            subtitle_basename=subtitle_basename,
         )
 
         original_name = Path(video.original_video.name).name
@@ -124,9 +127,14 @@ def process_video_dubbing(video_id):
             with open(output_video_path, "rb") as output_file:
                 video.dubbed_video.save(output_name, File(output_file), save=False)
 
+            subtitle_path = Path(settings.MEDIA_ROOT) / "dubbed_videos" / subtitle_basename
+            if subtitle_path.exists():
+                with open(subtitle_path, "rb") as subtitle_file:
+                    video.subtitle_srt.save(subtitle_basename, File(subtitle_file), save=False)
+
         video.status = Video.STATUS_COMPLETED
         video.error_message = ""
-        video.save(update_fields=["dubbed_video", "status", "error_message"])
+        video.save(update_fields=["dubbed_video", "subtitle_srt", "status", "error_message"])
 
         return {
             "video_id": video.id,

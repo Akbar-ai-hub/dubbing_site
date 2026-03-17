@@ -18,11 +18,12 @@ class VideoSerializer(serializers.ModelSerializer):
             "id",
             "original_video",
             "dubbed_video",
+            "subtitle_srt",
             "status",
             "error_message",
             "created_at",
         ]
-        read_only_fields = ["status", "dubbed_video", "error_message"]
+        read_only_fields = ["status", "dubbed_video", "subtitle_srt", "error_message"]
 
     def validate_original_video(self, file_obj):
         max_mb = int(getattr(settings, "MAX_UPLOAD_VIDEO_MB", 100))

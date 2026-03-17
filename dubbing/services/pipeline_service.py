@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 from .ffmpeg_service import FFmpegService
+from .demucs_service import DemucsService
 from .prosody_service import ProsodyDurationMapperService
 from .speaker_service import SpeakerEmbeddingService, cosine_similarity
 from .translation_service import LocalNLLBTranslationService
@@ -66,7 +67,7 @@ class DubbingPipelineService:
         min_segment_duration=0.4,
         max_speaker_gap_seconds=0.2,
         min_tempo_factor=0.90,
-        max_tempo_factor=1.60,
+        max_tempo_factor=2.0,
         speaker_ref_target_seconds=8.0,
         speaker_ref_min_seconds=6.0,
         speaker_ref_max_seconds=12.0,
@@ -76,8 +77,10 @@ class DubbingPipelineService:
         speaker_embedding_min_seconds=2.0,
         speaker_embedding_device=None,
         ref_audio_output_dir=None,
+        subtitle_basename=None,
     ):
         self.ffmpeg = FFmpegService(ffmpeg_bin=ffmpeg_bin)
+        self.demucs = DemucsService()
         self.whisper = WhisperService(model_name=whisper_model_name, api_key=groq_api_key)
         self.translation = LocalNLLBTranslationService(
             model_dir=translation_model_dir,
@@ -119,6 +122,7 @@ class DubbingPipelineService:
         self.ref_audio_output_dir = (
             str(ref_audio_output_dir).strip() if ref_audio_output_dir else ""
         ) or None
+        self.subtitle_basename = (str(subtitle_basename).strip() if subtitle_basename else "") or None
 
     def run(self, input_video_path, extracted_audio_path, tts_audio_path, output_video_path):
         # 1) Extract full audio
@@ -178,7 +182,8 @@ class DubbingPipelineService:
 
         # 6) Translate in one local batch
         src_texts = [m["text"] for m in merged]
-        translations = self.translation.translate_batch(src_texts)
+        translations = [self.translation.translate(text) for text in src_texts]
+        self._write_sidecar_srt(merged, translations)
 
         # 7) Build speaker reference wavs (target ~8s)
         speaker_to_seg_audio = self._collect_segment_audio_by_speaker(
@@ -203,13 +208,16 @@ class DubbingPipelineService:
         transcript_text = []
         translated_text = []
 
-        timeline_shift = 0.0
-        for idx, (m, tr_text) in enumerate(zip(merged, translations)):
+        idx = 0
+        while idx < len(merged):
+            m = merged[idx]
             spk = m["speaker"]
             start = float(m["start"])
             end = float(m["end"])
+            tr_text = translations[idx]
+            src_text = m["text"]
+
             # Each segment must occupy the window [start, next_start) without cutting audio.
-            # If there is a gap, we fill it (slow-down or pad); if it doesn't fit, we speed-up.
             if idx + 1 < len(merged):
                 next_start = float(merged[idx + 1]["start"])
                 window_end = next_start if next_start > start else end
@@ -249,9 +257,6 @@ class DubbingPipelineService:
                 ref_path,
             )
 
-            transcript_text.append(m["text"])
-            translated_text.append(tr_text)
-
             seg_tts_path = str(work_dir / f"tts_{idx:04d}.wav")
             seg_mapped_path = str(work_dir / f"tts_{idx:04d}_mapped.wav")
 
@@ -262,41 +267,82 @@ class DubbingPipelineService:
                 language=self.tts_target_language,
             )
             source_duration = self.ffmpeg.get_duration(seg_tts_path)
-            target_duration = base_window
             max_speedup = float(self.prosody.max_tempo_factor)
             needed_factor = source_duration / max(0.01, base_window)
-            if needed_factor > max_speedup:
-                # Avoid too-fast speech: keep tempo at max, extend the window instead.
-                target_duration = source_duration / max_speedup
-                overflow = target_duration - base_window
-                timeline_shift += max(0.0, overflow)
+
+            # If too fast, try merging with the next segment of the same speaker.
+            merge_end = idx
+            while (
+                needed_factor > max_speedup
+                and (merge_end + 1) < len(merged)
+                and merged[merge_end + 1]["speaker"] == spk
+            ):
+                merge_end += 1
+                src_text = (src_text + " " + merged[merge_end]["text"]).strip()
+                tr_text = (tr_text + " " + translations[merge_end]).strip()
+                end = float(merged[merge_end]["end"])
+                if (merge_end + 1) < len(merged):
+                    next_start = float(merged[merge_end + 1]["start"])
+                    window_end = next_start if next_start > start else end
+                else:
+                    window_end = end
+                base_window = max(0.01, window_end - start)
+
+                self.tts.synthesize_to_file(
+                    text=tr_text,
+                    output_audio_path=seg_tts_path,
+                    speaker_reference_audio=ref_path,
+                    language=self.tts_target_language,
+                )
+                source_duration = self.ffmpeg.get_duration(seg_tts_path)
+                needed_factor = source_duration / max(0.01, base_window)
+
+            if merge_end > idx:
                 logger.warning(
-                    "Segment %d exceeds max tempo. source=%.2fs window=%.2fs needed=%.2f max=%.2f -> extend by %.2fs",
+                    "Merged segments %d..%d for speaker %s to avoid over-speed (needed=%.2f max=%.2f).",
                     idx,
-                    source_duration,
-                    base_window,
+                    merge_end,
+                    spk,
                     needed_factor,
                     max_speedup,
-                    max(0.0, overflow),
                 )
 
             self.prosody.map_to_duration(
                 input_audio_path=seg_tts_path,
                 output_audio_path=seg_mapped_path,
-                target_duration_sec=target_duration,
+                target_duration_sec=base_window,
             )
 
-            timeline_segments.append({"path": seg_mapped_path, "start": start + timeline_shift})
+            transcript_text.append(src_text)
+            translated_text.append(tr_text)
 
-        total_duration = max(total_duration, (merged[-1]["end"] + timeline_shift)) if merged else total_duration
+            timeline_segments.append({"path": seg_mapped_path, "start": start})
+            idx = merge_end + 1
+
         self.ffmpeg.mix_segments_on_timeline(
             segments=timeline_segments,
             output_audio_path=tts_audio_path,
             total_duration_sec=total_duration,
         )
+        # Mix background (non-vocals) at -20 dB under the dubbed audio.
+        mixed_tts_path = str(Path(tts_audio_path).with_name("tts_with_bg.wav"))
+        try:
+            demucs_out = Path(extracted_audio_path).resolve().parent / "demucs_bg"
+            background_path = self.demucs.separate_background(extracted_audio_path, demucs_out)
+            self.ffmpeg.mix_with_background(
+                foreground_audio_path=tts_audio_path,
+                background_audio_path=background_path,
+                output_audio_path=mixed_tts_path,
+                bg_gain_db=-20,
+            )
+            final_audio_path = mixed_tts_path
+        except Exception as exc:
+            logger.warning("Failed to mix background noise, using clean TTS audio: %s", exc)
+            final_audio_path = tts_audio_path
+
         self.ffmpeg.mux_audio_with_video(
             input_video_path=input_video_path,
-            input_audio_path=tts_audio_path,
+            input_audio_path=final_audio_path,
             output_video_path=output_video_path,
         )
 
@@ -325,6 +371,43 @@ class DubbingPipelineService:
                 logger.info("Speaker %s reference copied to: %s", spk, dest)
             except Exception as exc:
                 logger.warning("Failed to persist speaker ref %s to %s: %s", spk, dest, exc)
+
+    def _write_sidecar_srt(self, merged, translations):
+        if not self.ref_audio_output_dir or not self.subtitle_basename:
+            return
+        if not merged or not translations:
+            return
+
+        out_dir = Path(self.ref_audio_output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / self.subtitle_basename
+
+        lines = []
+        for idx, (seg, text) in enumerate(zip(merged, translations), start=1):
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            if end <= start:
+                end = start + 0.2
+            lines.append(str(idx))
+            lines.append(f"{self._fmt_srt_ts(start)} --> {self._fmt_srt_ts(end)}")
+            lines.append((text or "").strip())
+            lines.append("")
+
+        try:
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+            logger.info("SRT subtitle written: %s", out_path)
+        except Exception as exc:
+            logger.warning("Failed to write SRT subtitle: %s", exc)
+
+    def _fmt_srt_ts(self, seconds):
+        total_ms = int(max(0.0, float(seconds)) * 1000)
+        ms = total_ms % 1000
+        total_s = total_ms // 1000
+        s = total_s % 60
+        total_m = total_s // 60
+        m = total_m % 60
+        h = total_m // 60
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     def _split_whisper_segments_into_subsegments(self, whisper_segments):
         out = []
@@ -546,12 +629,30 @@ class DubbingPipelineService:
 
             out_path = str(Path(work_dir) / f"ref_{spk}.wav")
             self.ffmpeg.concat_audio_files(chosen, out_path)
+
+            # Optional: use demucs to isolate vocals (reduce background music).
+            vocals_path = None
+            try:
+                demucs_out = Path(work_dir) / "demucs"
+                vocals_path = self.demucs.separate_vocals(out_path, demucs_out)
+                out_path = vocals_path
+            except Exception as exc:
+                logger.warning("Demucs vocals separation failed for %s: %s", spk, exc)
+
+            # Denoise and resample to 22050 Hz as XTTS reference requirement.
             denoised_path = str(Path(work_dir) / f"ref_{spk}_denoised.wav")
             try:
                 self.ffmpeg.denoise_audio(out_path, denoised_path)
                 out_path = denoised_path
             except Exception as exc:
                 logger.warning("Failed to denoise speaker ref %s: %s", spk, exc)
+
+            resampled_path = str(Path(work_dir) / f"ref_{spk}_denoised_22050.wav")
+            try:
+                self.ffmpeg.resample_audio(out_path, resampled_path, sample_rate_hz=22050)
+                out_path = resampled_path
+            except Exception as exc:
+                logger.warning("Failed to resample speaker ref %s: %s", spk, exc)
             logger.info(
                 "Speaker %s reference details: target=%.2fs min=%.2fs max=%.2fs chosen_total=%.2fs chosen_files=%s",
                 spk,
