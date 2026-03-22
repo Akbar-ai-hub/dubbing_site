@@ -33,6 +33,16 @@ def get_tokens_for_user(user):
         "access": str(refresh.access_token),
     }
 
+class CurrentUserView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        return Response({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+        })
 
 class RegisterView(APIView):
     throttle_classes = [RegisterThrottle]

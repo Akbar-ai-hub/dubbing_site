@@ -11,6 +11,7 @@ from .models import Video
 
 class VideoSerializer(serializers.ModelSerializer):
     ALLOWED_ENGLISH_CODES = ("en", "en-us", "en-gb", "english")
+    share_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Video
@@ -19,11 +20,22 @@ class VideoSerializer(serializers.ModelSerializer):
             "original_video",
             "dubbed_video",
             "subtitle_srt",
+            "share_enabled",
+            "share_token",
+            "share_url",
             "status",
             "error_message",
             "created_at",
         ]
-        read_only_fields = ["status", "dubbed_video", "subtitle_srt", "error_message"]
+        read_only_fields = [
+            "status",
+            "dubbed_video",
+            "subtitle_srt",
+            "share_enabled",
+            "share_token",
+            "share_url",
+            "error_message",
+        ]
 
     def validate_original_video(self, file_obj):
         max_mb = int(getattr(settings, "MAX_UPLOAD_VIDEO_MB", 100))
@@ -88,3 +100,9 @@ class VideoSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     f"Original video language must be English. Detected: '{detected_language or 'unknown'}'."
                 )
+
+    def get_share_url(self, obj):
+        request = self.context.get("request")
+        if not obj.share_enabled or not obj.share_token or not request:
+            return None
+        return request.build_absolute_uri(f"/api/videos/share/{obj.share_token}/")

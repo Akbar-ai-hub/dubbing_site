@@ -1,6 +1,10 @@
+import os
+import tempfile
+from django.conf import settings
 from django.http import FileResponse
+from urllib.parse import urlparse
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -32,7 +36,103 @@ class VideoUploadView(APIView):
             status=Video.STATUS_UPLOADED,
         )
 
-        return Response(VideoSerializer(video).data, status=status.HTTP_201_CREATED)
+        return Response(VideoSerializer(video, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+# ---------------------------
+# YOUTUBE DOWNLOAD
+# ---------------------------
+
+class YouTubeDownloadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        url = (request.data.get("url") or "").strip()
+        if not url:
+            return Response(
+                {"error": "YouTube URL was not provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not self._is_youtube_url(url):
+            return Response(
+                {"error": "Only YouTube URLs are supported."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            from yt_dlp import YoutubeDL
+        except Exception:
+            return Response(
+                {"error": "yt-dlp is not installed. Install it to enable YouTube downloads."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        max_mb = int(getattr(settings, "MAX_UPLOAD_VIDEO_MB", 100))
+        max_bytes = max_mb * 1024 * 1024
+
+        with tempfile.TemporaryDirectory(prefix="yt_download_") as tmp_dir:
+            outtmpl = os.path.join(tmp_dir, "%(title)s.%(ext)s")
+            ydl_opts = {
+                "format": "mp4/bestvideo+bestaudio/best",
+                "merge_output_format": "mp4",
+                "outtmpl": outtmpl,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            try:
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+            except Exception as exc:
+                return Response(
+                    {"error": f"Failed to download YouTube video: {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Pick the largest file from the temp dir (merged mp4).
+            files = [
+                os.path.join(tmp_dir, f)
+                for f in os.listdir(tmp_dir)
+                if os.path.isfile(os.path.join(tmp_dir, f))
+            ]
+            if not files:
+                return Response(
+                    {"error": "Downloaded file not found"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            file_path = max(files, key=lambda p: os.path.getsize(p))
+            file_size = os.path.getsize(file_path)
+            if file_size > max_bytes:
+                return Response(
+                    {"error": f"Downloaded file exceeds {max_mb}MB limit."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            with open(file_path, "rb") as f:
+                video = Video.objects.create(
+                    user=request.user,
+                    status=Video.STATUS_UPLOADED,
+                )
+                video.original_video.save(os.path.basename(file_path), f, save=True)
+
+        return Response(VideoSerializer(video, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    def _is_youtube_url(self, url):
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return False
+        allowed = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+        }
+        return host in allowed
 
 
 # ---------------------------
@@ -44,7 +144,7 @@ class UserVideoListView(APIView):
 
     def get(self, request):
         videos = Video.objects.filter(user=request.user).order_by("-created_at")
-        serializer = VideoSerializer(videos, many=True)
+        serializer = VideoSerializer(videos, many=True, context={"request": request})
         return Response(serializer.data)
 
 
@@ -61,7 +161,7 @@ class VideoDetailView(APIView):
         except Video.DoesNotExist:
             return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = VideoSerializer(video)
+        serializer = VideoSerializer(video, context={"request": request})
         return Response(serializer.data)
 
 
@@ -89,6 +189,62 @@ class VideoDeleteView(APIView):
 
         video.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------
+# SHARE LINK CREATE
+# ---------------------------
+
+class ShareDubbedVideoView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, video_id):
+        try:
+            video = Video.objects.get(id=video_id, user=request.user)
+        except Video.DoesNotExist:
+            return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not video.dubbed_video:
+            return Response(
+                {"error": "Dubbed video is not available yet"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not video.share_token:
+            video.share_token = self._generate_token()
+        video.share_enabled = True
+        video.save(update_fields=["share_token", "share_enabled"])
+
+        serializer = VideoSerializer(video, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def _generate_token(self):
+        import uuid
+
+        return uuid.uuid4().hex
+
+
+# ---------------------------
+# SHARE LINK ACCESS (PUBLIC)
+# ---------------------------
+
+class SharedDubbedVideoAccessView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, token):
+        try:
+            video = Video.objects.get(share_token=token, share_enabled=True)
+        except Video.DoesNotExist:
+            return Response({"error": "Shared video not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not video.dubbed_video:
+            return Response(
+                {"error": "Dubbed video is not available yet"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        file_name = video.dubbed_video.name.split("/")[-1]
+        return FileResponse(video.dubbed_video.open("rb"), as_attachment=True, filename=file_name)
 
 
 # ---------------------------
