@@ -31,8 +31,9 @@ class StartDubbingView(APIView):
             )
 
         video.status = Video.STATUS_PROCESSING
+        video.progress_percent = 0
         video.error_message = ""
-        video.save(update_fields=["status", "error_message"])
+        video.save(update_fields=["status", "progress_percent", "error_message"])
 
         try:
             task = process_video_dubbing.delay(video.id)
@@ -51,6 +52,7 @@ class StartDubbingView(APIView):
                 "task_id": task.id,
                 "video_id": video.id,
                 "status": video.status,
+                "progress_percent": video.progress_percent,
             },
             status=status.HTTP_202_ACCEPTED,
         )

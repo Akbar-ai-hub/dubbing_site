@@ -10,12 +10,20 @@ class CoquiTTSService:
     def __init__(
         self,
         xtts_local_dir,
-        xtts_fallback_language="tr",
+        temperature=0.5,
+        length_penalty=1.0,
+        repetition_penalty=3.0,
+        top_k=50,
+        top_p=0.9,
     ):
         self.xtts_local_dir = (xtts_local_dir or "").strip() or None
         if not self.xtts_local_dir:
             raise RuntimeError("COQUI_XTTS_LOCAL_DIR is required for XTTS fine-tuned model")
-        self.xtts_fallback_language = (xtts_fallback_language or "tr").strip().lower()
+        self.temperature = float(temperature)
+        self.length_penalty = float(length_penalty)
+        self.repetition_penalty = float(repetition_penalty)
+        self.top_k = int(top_k)
+        self.top_p = float(top_p)
         self._tts = None
 
     def synthesize_to_file(self, text, output_audio_path, speaker_reference_audio=None, language=None):
@@ -32,71 +40,23 @@ class CoquiTTSService:
 
         kwargs = {"text": normalized, "file_path": output_audio_path}
         kwargs["speaker_wav"] = speaker_reference_audio
+        kwargs["temperature"] = self.temperature
+        kwargs["length_penalty"] = self.length_penalty
+        kwargs["repetition_penalty"] = self.repetition_penalty
+        kwargs["top_k"] = self.top_k
+        kwargs["top_p"] = self.top_p
         requested_language = (language or "").strip().lower()
-        fallback_language = (self.xtts_fallback_language or "").strip().lower()
-        resolved_language = requested_language or fallback_language
-        if resolved_language:
-            kwargs["language"] = resolved_language
+        if requested_language:
+            kwargs["language"] = requested_language
 
-        try:
-            tts.tts_to_file(**kwargs)
-        except Exception as exc:
-            # If the fine-tuned model actually supports `kk`, we want to pass it through.
-            # But if it doesn't, retry once with fallback language instead of failing the whole segment.
-            message = str(exc).lower()
-            if (
-                requested_language
-                and fallback_language
-                and requested_language != fallback_language
-                and ("language" in message and "not supported" in message)
-            ):
-                # First try to enable the language in the loaded model object (some fine-tunes add
-                # language embeddings but upstream validation list may be stale/hardcoded).
-                if self._try_enable_language(tts, requested_language):
-                    logger.warning(
-                        "XTTS language '%s' was rejected; enabled it on the loaded model and retrying.",
-                        requested_language,
-                    )
-                    kwargs["language"] = requested_language
-                    tts.tts_to_file(**kwargs)
-                else:
-                    logger.warning(
-                        "XTTS language '%s' not supported by the loaded model; retrying with fallback '%s'.",
-                        requested_language,
-                        fallback_language,
-                    )
-                    kwargs["language"] = fallback_language
-                    tts.tts_to_file(**kwargs)
-            else:
-                raise
+        logger.info(
+            "XTTS synth call: language=%s speaker_wav=%s text=%s",
+            requested_language or "<none>",
+            speaker_reference_audio,
+            normalized,
+        )
+        tts.tts_to_file(**kwargs)
         return output_audio_path
-
-    def _try_enable_language(self, tts, language):
-        lang = (language or "").strip().lower()
-        if not lang:
-            return False
-
-        candidates = []
-        # Common attribute layouts across Coqui TTS versions.
-        candidates.append(getattr(tts, "tts_model", None))
-        synthesizer = getattr(tts, "synthesizer", None)
-        if synthesizer is not None:
-            candidates.append(getattr(synthesizer, "tts_model", None))
-
-        enabled = False
-        for model in candidates:
-            if model is None:
-                continue
-            langs = getattr(model, "languages", None)
-            if isinstance(langs, (list, tuple)):
-                if lang not in langs:
-                    try:
-                        langs.append(lang)
-                    except Exception:
-                        continue
-                enabled = True
-
-        return enabled
 
     def _get_coqui_tts(self):
         if self._tts is not None:

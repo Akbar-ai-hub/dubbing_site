@@ -1,5 +1,6 @@
 import logging
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,14 +61,18 @@ class DubbingPipelineService:
         diarization_min_speakers=None,  # kept for backward compatibility; unused
         diarization_max_speakers=None,  # kept for backward compatibility; unused
         tts_xtts_local_dir=None,
-        xtts_fallback_language="tr",
         tts_target_language="",
+        xtts_temperature=0.5,
+        xtts_length_penalty=1.0,
+        xtts_repetition_penalty=3.0,
+        xtts_top_k=50,
+        xtts_top_p=0.9,
         # The following knobs default to sane values and are intended to be auto-tuned.
         # We keep them as parameters for code-level control, but do not require .env tuning.
         min_segment_duration=0.4,
         max_speaker_gap_seconds=0.2,
         min_tempo_factor=0.90,
-        max_tempo_factor=2.0,
+        max_tempo_factor=3.0,
         speaker_ref_target_seconds=8.0,
         speaker_ref_min_seconds=6.0,
         speaker_ref_max_seconds=12.0,
@@ -91,7 +96,11 @@ class DubbingPipelineService:
         )
         self.tts = CoquiTTSService(
             xtts_local_dir=tts_xtts_local_dir,
-            xtts_fallback_language=xtts_fallback_language,
+            temperature=xtts_temperature,
+            length_penalty=xtts_length_penalty,
+            repetition_penalty=xtts_repetition_penalty,
+            top_k=xtts_top_k,
+            top_p=xtts_top_p,
         )
         self.prosody = ProsodyDurationMapperService(
             ffmpeg_service=self.ffmpeg,
@@ -124,11 +133,20 @@ class DubbingPipelineService:
         ) or None
         self.subtitle_basename = (str(subtitle_basename).strip() if subtitle_basename else "") or None
 
-    def run(self, input_video_path, extracted_audio_path, tts_audio_path, output_video_path):
+    def run(
+        self,
+        input_video_path,
+        extracted_audio_path,
+        tts_audio_path,
+        output_video_path,
+        progress_callback=None,
+    ):
+        self._emit_progress(progress_callback, 5, "extract_audio")
         # 1) Extract full audio
         self.ffmpeg.extract_audio(input_video_path=input_video_path, output_audio_path=extracted_audio_path)
         total_duration = self.ffmpeg.get_duration(extracted_audio_path)
 
+        self._emit_progress(progress_callback, 12, "transcription")
         # 2) ASR
         asr = self.whisper.transcribe(extracted_audio_path, language=self.source_language)
         detected_language = asr.get("language")
@@ -137,10 +155,12 @@ class DubbingPipelineService:
         if not whisper_segments:
             raise RuntimeError("Whisper returned no segments")
 
+        self._emit_progress(progress_callback, 22, "segmenting")
         # 3) Split into sentence-like subsegments
         raw_segments = self._split_whisper_segments_into_subsegments(whisper_segments)
         raw_segments = self._merge_too_short_segments(raw_segments, min_dur=self.min_segment_duration)
 
+        self._emit_progress(progress_callback, 32, "speaker_embedding")
         # 4) Extract audio per segment + embedding + speaker assignment
         work_dir = Path(extracted_audio_path).resolve().parent
         segment_audio_paths = []
@@ -177,14 +197,17 @@ class DubbingPipelineService:
 
         speaker_ids = self._assign_speakers_offline(embeddings, raw_segments)
 
+        self._emit_progress(progress_callback, 45, "merge_segments")
         # 5) Merge adjacent segments by speaker and gap
         merged = self._merge_adjacent_by_speaker(raw_segments, speaker_ids, max_gap=self.max_speaker_gap_seconds)
 
+        self._emit_progress(progress_callback, 55, "translation")
         # 6) Translate in one local batch
         src_texts = [m["text"] for m in merged]
         translations = [self.translation.translate(text) for text in src_texts]
         self._write_sidecar_srt(merged, translations)
 
+        self._emit_progress(progress_callback, 62, "speaker_reference")
         # 7) Build speaker reference wavs (target ~8s)
         speaker_to_seg_audio = self._collect_segment_audio_by_speaker(
             merged=merged,
@@ -207,6 +230,7 @@ class DubbingPipelineService:
         timeline_segments = []
         transcript_text = []
         translated_text = []
+        total_segments = max(1, len(merged))
 
         idx = 0
         while idx < len(merged):
@@ -317,8 +341,12 @@ class DubbingPipelineService:
             translated_text.append(tr_text)
 
             timeline_segments.append({"path": seg_mapped_path, "start": start})
+            processed_segments = merge_end + 1
+            tts_progress = 62 + int((processed_segments / total_segments) * 28)
+            self._emit_progress(progress_callback, tts_progress, "tts")
             idx = merge_end + 1
 
+        self._emit_progress(progress_callback, 92, "audio_mix")
         self.ffmpeg.mix_segments_on_timeline(
             segments=timeline_segments,
             output_audio_path=tts_audio_path,
@@ -340,6 +368,7 @@ class DubbingPipelineService:
             logger.warning("Failed to mix background noise, using clean TTS audio: %s", exc)
             final_audio_path = tts_audio_path
 
+        self._emit_progress(progress_callback, 97, "video_mux")
         self.ffmpeg.mux_audio_with_video(
             input_video_path=input_video_path,
             input_audio_path=final_audio_path,
@@ -353,6 +382,14 @@ class DubbingPipelineService:
             "translated_text": " ".join([t for t in translated_text if t]).strip(),
             "speaker_references": {k: v["path"] for k, v in speaker_refs.items()},
         }
+
+    def _emit_progress(self, callback, percent, stage):
+        if not callback:
+            return
+        try:
+            callback(max(0, min(99, int(percent))), stage)
+        except Exception as exc:
+            logger.warning("Progress callback failed at stage %s: %s", stage, exc)
 
     def _persist_reference_audio(self, speaker_refs):
         if not self.ref_audio_output_dir or not speaker_refs:
@@ -390,11 +427,13 @@ class DubbingPipelineService:
                 end = start + 0.2
             lines.append(str(idx))
             lines.append(f"{self._fmt_srt_ts(start)} --> {self._fmt_srt_ts(end)}")
-            lines.append((text or "").strip())
+            lines.extend(self._format_srt_text(text))
             lines.append("")
 
         try:
-            out_path.write_text("\n".join(lines), encoding="utf-8")
+            # Windows media players are much more reliable with UTF-8 BOM + CRLF for Cyrillic SRT.
+            with out_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                handle.write("\r\n".join(lines) + "\r\n")
             logger.info("SRT subtitle written: %s", out_path)
         except Exception as exc:
             logger.warning("Failed to write SRT subtitle: %s", exc)
@@ -408,6 +447,17 @@ class DubbingPipelineService:
         m = total_m % 60
         h = total_m // 60
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def _format_srt_text(self, text, line_width=42):
+        normalized = " ".join((text or "").replace("\r", " ").replace("\n", " ").split()).strip()
+        if not normalized:
+            return [""]
+        return textwrap.wrap(
+            normalized,
+            width=max(10, int(line_width)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [normalized]
 
     def _split_whisper_segments_into_subsegments(self, whisper_segments):
         out = []

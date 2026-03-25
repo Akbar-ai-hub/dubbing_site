@@ -17,6 +17,32 @@ from .services import DubbingPipelineService
 def _get_setting(name, default=None):
     return getattr(settings, name, os.environ.get(name, default))
 
+
+def _update_video_progress(video_id, percent, stage=None):
+    clamped = max(0, min(100, int(percent)))
+    Video.objects.filter(id=video_id).update(progress_percent=clamped)
+    if stage:
+        logger.info("Dubbing progress video=%s %s%% stage=%s", video_id, clamped, stage)
+
+
+def _cleanup_stale_subtitles(video_id, keep_name=None):
+    subtitle_dir = Path(settings.MEDIA_ROOT) / "dubbed_videos"
+    if not subtitle_dir.exists():
+        return
+
+    keep_basename = Path(keep_name).name if keep_name else None
+    pattern = f"dubbed_{video_id}_*.srt"
+    for path in subtitle_dir.glob(pattern):
+        if keep_basename and path.name == keep_basename:
+            continue
+        try:
+            path.unlink()
+            logger.info("Deleted stale subtitle file: %s", path)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.warning("Failed to delete stale subtitle file %s: %s", path, exc)
+
 logger = logging.getLogger(__name__)
 
 @shared_task
@@ -28,11 +54,14 @@ def process_video_dubbing(video_id):
 
     if not video.original_video:
         video.status = Video.STATUS_FAILED
+        video.progress_percent = 0
         video.error_message = "Original video is missing"
-        video.save(update_fields=["status", "error_message"])
+        video.save(update_fields=["status", "progress_percent", "error_message"])
         return {"error": "Original video is missing"}
 
     try:
+        _update_video_progress(video.id, 2, "initializing")
+        original_name = Path(video.original_video.name).name
         ffmpeg_bin = _get_setting("FFMPEG_BIN", "ffmpeg")
         whisper_model = _get_setting("GROQ_ASR_MODEL", "whisper-large-v3")
         groq_api_key = _get_setting("GROQ_API_KEY", "")
@@ -54,7 +83,11 @@ def process_video_dubbing(video_id):
         huggingface_token = _get_setting("HUGGINGFACE_TOKEN", "")
         tts_target_language = _get_setting("TTS_TARGET_LANGUAGE", "")
         tts_xtts_local_dir = _get_setting("COQUI_XTTS_LOCAL_DIR", "")
-        xtts_fallback_language = _get_setting("XTTS_FALLBACK_LANGUAGE", "tr")
+        xtts_temperature = float(_get_setting("XTTS_TEMPERATURE", 0.5))
+        xtts_length_penalty = float(_get_setting("XTTS_LENGTH_PENALTY", 1.0))
+        xtts_repetition_penalty = float(_get_setting("XTTS_REPETITION_PENALTY", 3.0))
+        xtts_top_k = int(_get_setting("XTTS_TOP_K", 50))
+        xtts_top_p = float(_get_setting("XTTS_TOP_P", 0.9))
         speaker_embedding_model_name = _get_setting("SPEAKER_EMBEDDING_MODEL_NAME", "pyannote/embedding")
         # Backward-compat: if SPEAKER_EMBEDDING_MODEL_DIR is set to ...\\hub\\models--...,
         # we can infer the hub cache directory (the parent of models--...).
@@ -91,8 +124,12 @@ def process_video_dubbing(video_id):
             diarization_min_speakers=diarization_min_speakers,
             diarization_max_speakers=diarization_max_speakers,
             tts_xtts_local_dir=(tts_xtts_local_dir or None),
-            xtts_fallback_language=xtts_fallback_language,
             tts_target_language=tts_target_language,
+            xtts_temperature=xtts_temperature,
+            xtts_length_penalty=xtts_length_penalty,
+            xtts_repetition_penalty=xtts_repetition_penalty,
+            xtts_top_k=xtts_top_k,
+            xtts_top_p=xtts_top_p,
             speaker_embedding_model_name=speaker_embedding_model_name,
             speaker_embedding_cache_dir=(speaker_embedding_cache_dir or None),
             speaker_embedding_device=(speaker_embedding_device or None),
@@ -100,8 +137,9 @@ def process_video_dubbing(video_id):
             subtitle_basename=subtitle_basename,
         )
 
-        original_name = Path(video.original_video.name).name
         source_suffix = Path(original_name).suffix or ".mp4"
+        old_dubbed_name = video.dubbed_video.name if video.dubbed_video else None
+        old_subtitle_name = video.subtitle_srt.name if video.subtitle_srt else None
 
         with tempfile.TemporaryDirectory(prefix=f"dubbing_{video.id}_") as temp_dir:
             input_video_path = str(Path(temp_dir) / f"input{source_suffix}")
@@ -117,6 +155,7 @@ def process_video_dubbing(video_id):
                 extracted_audio_path=extracted_audio_path,
                 tts_audio_path=tts_audio_path,
                 output_video_path=output_video_path,
+                progress_callback=lambda percent, stage: _update_video_progress(video.id, percent, stage),
             )
 
             logger.info("Whisper transcript: %s", result.get("transcript_text"))
@@ -129,12 +168,19 @@ def process_video_dubbing(video_id):
 
             subtitle_path = Path(settings.MEDIA_ROOT) / "dubbed_videos" / subtitle_basename
             if subtitle_path.exists():
-                with open(subtitle_path, "rb") as subtitle_file:
-                    video.subtitle_srt.save(subtitle_basename, File(subtitle_file), save=False)
+                video.subtitle_srt.name = f"dubbed_videos/{subtitle_basename}"
 
         video.status = Video.STATUS_COMPLETED
+        video.progress_percent = 100
         video.error_message = ""
-        video.save(update_fields=["dubbed_video", "subtitle_srt", "status", "error_message"])
+        video.save(update_fields=["dubbed_video", "subtitle_srt", "status", "progress_percent", "error_message"])
+
+        _cleanup_stale_subtitles(video.id, keep_name=video.subtitle_srt.name if video.subtitle_srt else None)
+
+        if old_dubbed_name and old_dubbed_name != video.dubbed_video.name:
+            video.dubbed_video.storage.delete(old_dubbed_name)
+        if old_subtitle_name and video.subtitle_srt and old_subtitle_name != video.subtitle_srt.name:
+            video.subtitle_srt.storage.delete(old_subtitle_name)
 
         return {
             "video_id": video.id,

@@ -1,12 +1,12 @@
+import unicodedata
+
 from rest_framework import serializers
 from .models import User
-from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.contrib.auth.password_validation import validate_password
 from django.utils.html import strip_tags
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, validators=[validate_password])
-    username_validator = UnicodeUsernameValidator()
 
     class Meta:
         model = User
@@ -19,7 +19,23 @@ class RegisterSerializer(serializers.ModelSerializer):
         if strip_tags(normalized) != normalized:
             raise serializers.ValidationError("Username must not contain HTML or script content.")
 
-        self.username_validator(normalized)
+        if not normalized:
+            raise serializers.ValidationError("Username is required.")
+
+        if len(normalized) > 150:
+            raise serializers.ValidationError("Username must be 150 characters or fewer.")
+
+        allowed_punctuation = {" ", "-", "_", ".", "'"}
+        for char in normalized:
+            category = unicodedata.category(char)
+            if category.startswith(("L", "N")):
+                continue
+            if char in allowed_punctuation:
+                continue
+            raise serializers.ValidationError(
+                "Username may contain letters, numbers, spaces, and - _ . ' characters only."
+            )
+
         return normalized
 
     def validate_email(self, value):
@@ -32,3 +48,12 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data["password"]
         )
         return user
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop("password", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if password:
+            instance.set_password(password)
+        instance.save()
+        return instance

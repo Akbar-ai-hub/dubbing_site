@@ -24,6 +24,7 @@ class Video(models.Model):
     share_enabled = models.BooleanField(default=False)
     share_token = models.CharField(max_length=64, blank=True, null=True, unique=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_UPLOADED)
+    progress_percent = models.PositiveSmallIntegerField(default=0)
     error_message = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

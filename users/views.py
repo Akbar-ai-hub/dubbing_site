@@ -44,6 +44,50 @@ class CurrentUserView(APIView):
             "email": user.email,
         })
 
+
+class ProfileUpdateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request):
+        serializer = RegisterSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {
+                "message": "Profile updated successfully",
+                "user": {
+                    "id": request.user.id,
+                    "username": request.user.username,
+                    "email": request.user.email,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def put(self, request):
+        serializer = RegisterSerializer(
+            request.user,
+            data=request.data,
+            partial=False,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {
+                "message": "Profile updated successfully",
+                "user": {
+                    "id": request.user.id,
+                    "username": request.user.username,
+                    "email": request.user.email,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
 class RegisterView(APIView):
     throttle_classes = [RegisterThrottle]
 

@@ -24,11 +24,13 @@ class VideoSerializer(serializers.ModelSerializer):
             "share_token",
             "share_url",
             "status",
+            "progress_percent",
             "error_message",
             "created_at",
         ]
         read_only_fields = [
             "status",
+            "progress_percent",
             "dubbed_video",
             "subtitle_srt",
             "share_enabled",
