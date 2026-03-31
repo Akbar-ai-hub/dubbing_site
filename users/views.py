@@ -1,7 +1,9 @@
 import os
 from datetime import timedelta
+from decimal import Decimal
 
 from django.contrib.auth import authenticate, get_user_model
+from django.db import transaction
 from django.utils import timezone
 from google.auth.transport import requests
 from google.oauth2 import id_token
@@ -11,8 +13,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 
-from .models import PasswordResetCode
-from .serializers import RegisterSerializer
+from .models import BillingTransaction, PasswordResetCode
+from .serializers import BillingTransactionSerializer, RegisterSerializer, WalletTopUpSerializer
 from .throttles import (
     LoginThrottle,
     PasswordResetCompleteThrottle,
@@ -42,6 +44,7 @@ class CurrentUserView(APIView):
             "id": user.id,
             "username": user.username,
             "email": user.email,
+            "balance": str(user.balance),
         })
 
 
@@ -63,6 +66,7 @@ class ProfileUpdateView(APIView):
                     "id": request.user.id,
                     "username": request.user.username,
                     "email": request.user.email,
+                    "balance": str(request.user.balance),
                 },
             },
             status=status.HTTP_200_OK,
@@ -83,6 +87,7 @@ class ProfileUpdateView(APIView):
                     "id": request.user.id,
                     "username": request.user.username,
                     "email": request.user.email,
+                    "balance": str(request.user.balance),
                 },
             },
             status=status.HTTP_200_OK,
@@ -103,6 +108,7 @@ class RegisterView(APIView):
                     "user": {
                         "username": user.username,
                         "email": user.email,
+                        "balance": str(user.balance),
                     },
                     "tokens": tokens,
                 },
@@ -139,6 +145,7 @@ class LoginView(APIView):
                 "user": {
                     "username": user.username,
                     "email": user.email,
+                    "balance": str(user.balance),
                 },
                 "tokens": tokens,
             },
@@ -177,6 +184,7 @@ class GoogleLoginView(APIView):
                 "user": {
                     "username": user.username,
                     "email": user.email,
+                    "balance": str(user.balance),
                 },
                 "tokens": tokens,
             },
@@ -292,3 +300,47 @@ class LogoutView(APIView):
             )
 
         return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)
+
+
+class WalletBalanceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(
+            {"balance": str(request.user.balance)},
+            status=status.HTTP_200_OK,
+        )
+
+
+class WalletTopUpView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = WalletTopUpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        amount = serializer.validated_data["amount"]
+
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(id=request.user.id)
+            user.balance = (Decimal(user.balance) + Decimal(amount)).quantize(Decimal("0.01"))
+            user.save(update_fields=["balance"])
+            BillingTransaction.objects.create(
+                user=user,
+                txn_type=BillingTransaction.TYPE_TOP_UP,
+                amount=amount,
+                description="Manual top-up",
+            )
+
+        return Response(
+            {"message": "Balance topped up successfully", "balance": str(user.balance)},
+            status=status.HTTP_200_OK,
+        )
+
+
+class BillingHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        transactions = BillingTransaction.objects.filter(user=request.user).select_related("video")[:200]
+        serializer = BillingTransactionSerializer(transactions, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)

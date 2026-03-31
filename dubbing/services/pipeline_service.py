@@ -81,6 +81,7 @@ class DubbingPipelineService:
         speaker_embedding_cache_dir=None,
         speaker_embedding_min_seconds=2.0,
         speaker_embedding_device=None,
+        max_merge_chars=220,
         ref_audio_output_dir=None,
         subtitle_basename=None,
     ):
@@ -122,6 +123,7 @@ class DubbingPipelineService:
         self.speaker_ref_min_segment_seconds = float(speaker_ref_min_segment_seconds)
 
         self.speaker_embedding_min_seconds = float(speaker_embedding_min_seconds)
+        self.max_merge_chars = int(max_merge_chars)
         self.speaker_embedder = SpeakerEmbeddingService(
             model_name=speaker_embedding_model_name,
             cache_dir=speaker_embedding_cache_dir,
@@ -232,21 +234,28 @@ class DubbingPipelineService:
         translated_text = []
         total_segments = max(1, len(merged))
 
+        def _window_end(chunk_start_idx, chunk_end_idx):
+            start_val = float(merged[chunk_start_idx]["start"])
+            end_val = float(merged[chunk_end_idx]["end"])
+            if chunk_end_idx + 1 < len(merged):
+                next_start_val = float(merged[chunk_end_idx + 1]["start"])
+                return next_start_val if next_start_val > start_val else end_val
+            return end_val
+
+        synthesized_chunks = []
         idx = 0
         while idx < len(merged):
             m = merged[idx]
             spk = m["speaker"]
+            chunk_start_idx = idx
+            chunk_end_idx = idx
             start = float(m["start"])
             end = float(m["end"])
             tr_text = translations[idx]
             src_text = m["text"]
 
             # Each segment must occupy the window [start, next_start) without cutting audio.
-            if idx + 1 < len(merged):
-                next_start = float(merged[idx + 1]["start"])
-                window_end = next_start if next_start > start else end
-            else:
-                window_end = end
+            window_end = _window_end(chunk_start_idx, chunk_end_idx)
             base_window = max(0.01, window_end - start)
 
             ref_path = None
@@ -281,8 +290,8 @@ class DubbingPipelineService:
                 ref_path,
             )
 
-            seg_tts_path = str(work_dir / f"tts_{idx:04d}.wav")
-            seg_mapped_path = str(work_dir / f"tts_{idx:04d}_mapped.wav")
+            seg_tts_path = str(work_dir / f"tts_{chunk_start_idx:04d}_{chunk_end_idx:04d}.wav")
+            seg_mapped_path = str(work_dir / f"tts_{chunk_start_idx:04d}_{chunk_end_idx:04d}_mapped.wav")
 
             self.tts.synthesize_to_file(
                 text=tr_text,
@@ -294,22 +303,59 @@ class DubbingPipelineService:
             max_speedup = float(self.prosody.max_tempo_factor)
             needed_factor = source_duration / max(0.01, base_window)
 
-            # If too fast, try merging with the next segment of the same speaker.
-            merge_end = idx
+            # If too fast, first try merging with previous synthesized chunk of the same speaker.
+            merged_with_previous = False
+            if needed_factor > max_speedup and synthesized_chunks:
+                prev_chunk = synthesized_chunks[-1]
+                if (
+                    prev_chunk["speaker"] == spk
+                    and prev_chunk["end_idx"] == (idx - 1)
+                ):
+                    candidate_tr_text = (prev_chunk["tr_text"] + " " + tr_text).strip()
+                    if len(candidate_tr_text) <= max(1, self.max_merge_chars):
+                        merged_with_previous = True
+                        synthesized_chunks.pop()
+                        if timeline_segments:
+                            timeline_segments.pop()
+                        if transcript_text:
+                            transcript_text.pop()
+                        if translated_text:
+                            translated_text.pop()
+                        chunk_start_idx = prev_chunk["start_idx"]
+                        start = float(prev_chunk["start"])
+                        src_text = (prev_chunk["src_text"] + " " + src_text).strip()
+                        tr_text = candidate_tr_text
+                        window_end = _window_end(chunk_start_idx, chunk_end_idx)
+                        base_window = max(0.01, window_end - start)
+                        seg_tts_path = str(work_dir / f"tts_{chunk_start_idx:04d}_{chunk_end_idx:04d}.wav")
+                        seg_mapped_path = str(
+                            work_dir / f"tts_{chunk_start_idx:04d}_{chunk_end_idx:04d}_mapped.wav"
+                        )
+                        self.tts.synthesize_to_file(
+                            text=tr_text,
+                            output_audio_path=seg_tts_path,
+                            speaker_reference_audio=ref_path,
+                            language=self.tts_target_language,
+                        )
+                        source_duration = self.ffmpeg.get_duration(seg_tts_path)
+                        needed_factor = source_duration / max(0.01, base_window)
+
+            # If still too fast, try merging with next same-speaker segments while text limit allows.
             while (
                 needed_factor > max_speedup
-                and (merge_end + 1) < len(merged)
-                and merged[merge_end + 1]["speaker"] == spk
+                and (chunk_end_idx + 1) < len(merged)
+                and merged[chunk_end_idx + 1]["speaker"] == spk
             ):
-                merge_end += 1
-                src_text = (src_text + " " + merged[merge_end]["text"]).strip()
-                tr_text = (tr_text + " " + translations[merge_end]).strip()
-                end = float(merged[merge_end]["end"])
-                if (merge_end + 1) < len(merged):
-                    next_start = float(merged[merge_end + 1]["start"])
-                    window_end = next_start if next_start > start else end
-                else:
-                    window_end = end
+                next_idx = chunk_end_idx + 1
+                candidate_tr_text = (tr_text + " " + translations[next_idx]).strip()
+                if len(candidate_tr_text) > max(1, self.max_merge_chars):
+                    break
+
+                chunk_end_idx = next_idx
+                src_text = (src_text + " " + merged[chunk_end_idx]["text"]).strip()
+                tr_text = candidate_tr_text
+                end = float(merged[chunk_end_idx]["end"])
+                window_end = _window_end(chunk_start_idx, chunk_end_idx)
                 base_window = max(0.01, window_end - start)
 
                 self.tts.synthesize_to_file(
@@ -321,11 +367,21 @@ class DubbingPipelineService:
                 source_duration = self.ffmpeg.get_duration(seg_tts_path)
                 needed_factor = source_duration / max(0.01, base_window)
 
-            if merge_end > idx:
+            if merged_with_previous:
+                logger.warning(
+                    "Merged segments %d..%d with previous speaker chunk for %s (needed=%.2f max=%.2f, chars=%d).",
+                    chunk_start_idx,
+                    chunk_end_idx,
+                    spk,
+                    needed_factor,
+                    max_speedup,
+                    len(tr_text),
+                )
+            if chunk_end_idx > idx:
                 logger.warning(
                     "Merged segments %d..%d for speaker %s to avoid over-speed (needed=%.2f max=%.2f).",
                     idx,
-                    merge_end,
+                    chunk_end_idx,
                     spk,
                     needed_factor,
                     max_speedup,
@@ -341,10 +397,20 @@ class DubbingPipelineService:
             translated_text.append(tr_text)
 
             timeline_segments.append({"path": seg_mapped_path, "start": start})
-            processed_segments = merge_end + 1
+            synthesized_chunks.append(
+                {
+                    "start_idx": chunk_start_idx,
+                    "end_idx": chunk_end_idx,
+                    "speaker": spk,
+                    "start": start,
+                    "src_text": src_text,
+                    "tr_text": tr_text,
+                }
+            )
+            processed_segments = chunk_end_idx + 1
             tts_progress = 62 + int((processed_segments / total_segments) * 28)
             self._emit_progress(progress_callback, tts_progress, "tts")
-            idx = merge_end + 1
+            idx = chunk_end_idx + 1
 
         self._emit_progress(progress_callback, 92, "audio_mix")
         self.ffmpeg.mix_segments_on_timeline(

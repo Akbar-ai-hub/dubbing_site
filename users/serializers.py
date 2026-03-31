@@ -1,7 +1,8 @@
 import unicodedata
+from decimal import Decimal
 
 from rest_framework import serializers
-from .models import User
+from .models import User, BillingTransaction
 from django.contrib.auth.password_validation import validate_password
 from django.utils.html import strip_tags
 
@@ -57,3 +58,13 @@ class RegisterSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         return instance
+
+
+class WalletTopUpSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+
+
+class BillingTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BillingTransaction
+        fields = ["id", "txn_type", "amount", "description", "video", "created_at"]

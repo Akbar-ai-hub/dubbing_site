@@ -9,6 +9,9 @@ from .views import (
     PasswordResetVerifyView,
     PasswordResetCompleteView,
     LogoutView,
+    WalletBalanceView,
+    WalletTopUpView,
+    BillingHistoryView,
 )
 
 urlpatterns = [
@@ -21,4 +24,7 @@ urlpatterns = [
     path('password-reset/request/', PasswordResetRequestView.as_view()),
     path('password-reset/verify/', PasswordResetVerifyView.as_view()),
     path('password-reset/complete/', PasswordResetCompleteView.as_view()),
+    path('wallet/', WalletBalanceView.as_view(), name='wallet-balance'),
+    path('wallet/top-up/', WalletTopUpView.as_view(), name='wallet-top-up'),
+    path('wallet/transactions/', BillingHistoryView.as_view(), name='wallet-transactions'),
 ]

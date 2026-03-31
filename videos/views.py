@@ -1,7 +1,9 @@
 import os
 import tempfile
 from django.conf import settings
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import FileResponse
+from django.utils import timezone
 from urllib.parse import urlparse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -9,7 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Video
-from .serializers import VideoSerializer
+from .serializers import VideoSerializer, VideoFeedbackSerializer
 
 
 # ---------------------------
@@ -109,11 +111,23 @@ class YouTubeDownloadView(APIView):
                 )
 
             with open(file_path, "rb") as f:
-                video = Video.objects.create(
-                    user=request.user,
-                    status=Video.STATUS_UPLOADED,
-                )
-                video.original_video.save(os.path.basename(file_path), f, save=True)
+                content = f.read()
+
+            uploaded = SimpleUploadedFile(
+                name=os.path.basename(file_path),
+                content=content,
+                content_type="video/mp4",
+            )
+
+            serializer = VideoSerializer(
+                data={"original_video": uploaded},
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            video = serializer.save(
+                user=request.user,
+                status=Video.STATUS_UPLOADED,
+            )
 
         return Response(VideoSerializer(video, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
@@ -268,3 +282,38 @@ class DubbedVideoDownloadView(APIView):
 
         file_name = video.dubbed_video.name.split("/")[-1]
         return FileResponse(video.dubbed_video.open("rb"), as_attachment=True, filename=file_name)
+
+
+class VideoFeedbackView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, video_id):
+        try:
+            video = Video.objects.get(id=video_id, user=request.user)
+        except Video.DoesNotExist:
+            return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if video.status != Video.STATUS_COMPLETED or not video.dubbed_video:
+            return Response(
+                {"error": "Feedback is available only after dubbing is completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = VideoFeedbackSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        video.feedback_rating = serializer.validated_data["rating"]
+        video.feedback_text = (serializer.validated_data.get("comment") or "").strip()
+        video.feedback_updated_at = timezone.now()
+        video.save(update_fields=["feedback_rating", "feedback_text", "feedback_updated_at"])
+
+        return Response(
+            {
+                "message": "Feedback saved successfully",
+                "video_id": video.id,
+                "feedback_rating": video.feedback_rating,
+                "feedback_text": video.feedback_text,
+                "feedback_updated_at": video.feedback_updated_at,
+            },
+            status=status.HTTP_200_OK,
+        )

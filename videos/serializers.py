@@ -25,12 +25,18 @@ class VideoSerializer(serializers.ModelSerializer):
             "share_url",
             "status",
             "progress_percent",
+            "feedback_rating",
+            "feedback_text",
+            "feedback_updated_at",
             "error_message",
             "created_at",
         ]
         read_only_fields = [
             "status",
             "progress_percent",
+            "feedback_rating",
+            "feedback_text",
+            "feedback_updated_at",
             "dubbed_video",
             "subtitle_srt",
             "share_enabled",
@@ -108,3 +114,8 @@ class VideoSerializer(serializers.ModelSerializer):
         if not obj.share_enabled or not obj.share_token or not request:
             return None
         return request.build_absolute_uri(f"/api/videos/share/{obj.share_token}/")
+
+
+class VideoFeedbackSerializer(serializers.Serializer):
+    rating = serializers.IntegerField(min_value=1, max_value=5)
+    comment = serializers.CharField(required=False, allow_blank=True, max_length=2000)

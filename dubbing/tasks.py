@@ -1,21 +1,80 @@
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 import logging
+from decimal import Decimal, ROUND_HALF_UP
 
 from celery import shared_task
 from django.conf import settings
 from django.core.files.base import File
-from pathlib import Path
+from django.db import transaction
 
 from videos.models import Video
+from users.models import BillingTransaction, User
 
 from .services import DubbingPipelineService
 
 
 def _get_setting(name, default=None):
     return getattr(settings, name, os.environ.get(name, default))
+
+
+def _to_decimal(value, default="0"):
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(str(default))
+
+
+def _bill_video_usage(video, gpu_seconds):
+    billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    if not billing_enabled:
+        return Decimal("0.00")
+
+    gpu_price_per_min = _to_decimal(getattr(settings, "GPU_PRICE_PER_MINUTE", "0.20"), "0.20")
+    storage_price_per_gb = _to_decimal(getattr(settings, "STORAGE_PRICE_PER_GB", "0.02"), "0.02")
+
+    gpu_minutes = (Decimal(str(max(0.0, gpu_seconds))) / Decimal("60"))
+    gpu_cost = (gpu_minutes * gpu_price_per_min)
+
+    total_bytes = 0
+    for f in [video.original_video, video.dubbed_video, video.subtitle_srt]:
+        if not f:
+            continue
+        try:
+            total_bytes += int(f.size)
+        except Exception:
+            pass
+    storage_gb = (Decimal(str(total_bytes)) / Decimal(str(1024 ** 3)))
+    storage_cost = storage_gb * storage_price_per_gb
+
+    total_cost = (gpu_cost + storage_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if total_cost <= Decimal("0.00"):
+        return Decimal("0.00")
+
+    with transaction.atomic():
+        user = User.objects.select_for_update().get(id=video.user_id)
+        if Decimal(str(user.balance)) < total_cost:
+            raise RuntimeError(
+                f"Insufficient balance for billing. Required={total_cost}, available={user.balance}."
+            )
+        user.balance = (Decimal(str(user.balance)) - total_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        user.save(update_fields=["balance"])
+        BillingTransaction.objects.create(
+            user=user,
+            video=video,
+            txn_type=BillingTransaction.TYPE_DUBBING_CHARGE,
+            amount=total_cost,
+            description=(
+                f"Dubbing charge: gpu_minutes={gpu_minutes.quantize(Decimal('0.001'))}, "
+                f"gpu_cost={gpu_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}, "
+                f"storage_gb={storage_gb.quantize(Decimal('0.0001'))}, "
+                f"storage_cost={storage_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
+            ),
+        )
+    return total_cost
 
 
 def _update_video_progress(video_id, percent, stage=None):
@@ -51,6 +110,15 @@ def process_video_dubbing(video_id):
         video = Video.objects.get(id=video_id)
     except Video.DoesNotExist:
         return {"error": "Video not found"}
+
+    if video.status not in (Video.STATUS_QUEUED, Video.STATUS_PROCESSING):
+        return {"video_id": video_id, "status": "skipped", "reason": f"status={video.status}"}
+
+    if video.status != Video.STATUS_PROCESSING:
+        video.status = Video.STATUS_PROCESSING
+        video.progress_percent = 1
+        video.error_message = ""
+        video.save(update_fields=["status", "progress_percent", "error_message"])
 
     if not video.original_video:
         video.status = Video.STATUS_FAILED
@@ -88,6 +156,7 @@ def process_video_dubbing(video_id):
         xtts_repetition_penalty = float(_get_setting("XTTS_REPETITION_PENALTY", 3.0))
         xtts_top_k = int(_get_setting("XTTS_TOP_K", 50))
         xtts_top_p = float(_get_setting("XTTS_TOP_P", 0.9))
+        max_merge_chars = int(_get_setting("MAX_MERGE_CHARS", 220))
         speaker_embedding_model_name = _get_setting("SPEAKER_EMBEDDING_MODEL_NAME", "pyannote/embedding")
         # Backward-compat: if SPEAKER_EMBEDDING_MODEL_DIR is set to ...\\hub\\models--...,
         # we can infer the hub cache directory (the parent of models--...).
@@ -130,6 +199,7 @@ def process_video_dubbing(video_id):
             xtts_repetition_penalty=xtts_repetition_penalty,
             xtts_top_k=xtts_top_k,
             xtts_top_p=xtts_top_p,
+            max_merge_chars=max_merge_chars,
             speaker_embedding_model_name=speaker_embedding_model_name,
             speaker_embedding_cache_dir=(speaker_embedding_cache_dir or None),
             speaker_embedding_device=(speaker_embedding_device or None),
@@ -150,6 +220,7 @@ def process_video_dubbing(video_id):
             with video.original_video.open("rb") as source_file, open(input_video_path, "wb") as dst:
                 shutil.copyfileobj(source_file, dst)
 
+            billing_started = time.monotonic()
             result = pipeline.run(
                 input_video_path=input_video_path,
                 extracted_audio_path=extracted_audio_path,
@@ -157,6 +228,7 @@ def process_video_dubbing(video_id):
                 output_video_path=output_video_path,
                 progress_callback=lambda percent, stage: _update_video_progress(video.id, percent, stage),
             )
+            billing_elapsed = max(0.0, time.monotonic() - billing_started)
 
             logger.info("Whisper transcript: %s", result.get("transcript_text"))
             logger.info("Translated text: %s", result.get("translated_text"))
@@ -175,6 +247,9 @@ def process_video_dubbing(video_id):
         video.error_message = ""
         video.save(update_fields=["dubbed_video", "subtitle_srt", "status", "progress_percent", "error_message"])
 
+        charged_amount = _bill_video_usage(video, gpu_seconds=billing_elapsed)
+        logger.info("Billing charged for video=%s amount=%s", video.id, charged_amount)
+
         _cleanup_stale_subtitles(video.id, keep_name=video.subtitle_srt.name if video.subtitle_srt else None)
 
         if old_dubbed_name and old_dubbed_name != video.dubbed_video.name:
@@ -190,6 +265,7 @@ def process_video_dubbing(video_id):
         }
     except Exception as exc:
         video.status = Video.STATUS_FAILED
+        video.progress_percent = 0
         video.error_message = str(exc)
-        video.save(update_fields=["status", "error_message"])
+        video.save(update_fields=["status", "progress_percent", "error_message"])
         return {"video_id": video.id, "status": video.status, "error": str(exc)}
