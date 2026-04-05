@@ -27,12 +27,26 @@ class Video(models.Model):
     share_token = models.CharField(max_length=64, blank=True, null=True, unique=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_UPLOADED)
     progress_percent = models.PositiveSmallIntegerField(default=0)
-    feedback_rating = models.PositiveSmallIntegerField(blank=True, null=True)
-    feedback_text = models.TextField(blank=True)
-    feedback_updated_at = models.DateTimeField(blank=True, null=True)
     error_message = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Video #{self.id} ({self.status})"
+
+
+class VideoFeedback(models.Model):
+    video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="feedbacks")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="video_feedbacks")
+    rating = models.PositiveSmallIntegerField()
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["video", "user"], name="uniq_video_feedback_per_user"),
+        ]
+
+    def __str__(self):
+        return f"Feedback(video={self.video_id}, user={self.user_id}, rating={self.rating})"
 

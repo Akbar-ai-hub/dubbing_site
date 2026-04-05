@@ -3,14 +3,13 @@ import tempfile
 from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import FileResponse
-from django.utils import timezone
 from urllib.parse import urlparse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Video
+from .models import Video, VideoFeedback
 from .serializers import VideoSerializer, VideoFeedbackSerializer
 
 
@@ -302,18 +301,22 @@ class VideoFeedbackView(APIView):
         serializer = VideoFeedbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        video.feedback_rating = serializer.validated_data["rating"]
-        video.feedback_text = (serializer.validated_data.get("comment") or "").strip()
-        video.feedback_updated_at = timezone.now()
-        video.save(update_fields=["feedback_rating", "feedback_text", "feedback_updated_at"])
+        feedback, _ = VideoFeedback.objects.update_or_create(
+            video=video,
+            user=request.user,
+            defaults={
+                "rating": serializer.validated_data["rating"],
+                "comment": (serializer.validated_data.get("comment") or "").strip(),
+            },
+        )
 
         return Response(
             {
                 "message": "Feedback saved successfully",
                 "video_id": video.id,
-                "feedback_rating": video.feedback_rating,
-                "feedback_text": video.feedback_text,
-                "feedback_updated_at": video.feedback_updated_at,
+                "feedback_rating": feedback.rating,
+                "feedback_text": feedback.comment,
+                "feedback_updated_at": feedback.updated_at,
             },
             status=status.HTTP_200_OK,
         )

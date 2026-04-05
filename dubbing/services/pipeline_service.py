@@ -72,7 +72,7 @@ class DubbingPipelineService:
         min_segment_duration=0.4,
         max_speaker_gap_seconds=0.2,
         min_tempo_factor=0.90,
-        max_tempo_factor=3.0,
+        max_tempo_factor=2.5,
         speaker_ref_target_seconds=8.0,
         speaker_ref_min_seconds=6.0,
         speaker_ref_max_seconds=12.0,

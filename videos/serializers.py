@@ -6,12 +6,15 @@ from rest_framework import serializers
 
 from dubbing.services.ffmpeg_service import FFmpegService
 from dubbing.services.whisper_service import WhisperService
-from .models import Video
+from .models import Video, VideoFeedback
 
 
 class VideoSerializer(serializers.ModelSerializer):
     ALLOWED_ENGLISH_CODES = ("en", "en-us", "en-gb", "english")
     share_url = serializers.SerializerMethodField()
+    feedback_rating = serializers.SerializerMethodField()
+    feedback_text = serializers.SerializerMethodField()
+    feedback_updated_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Video
@@ -114,6 +117,21 @@ class VideoSerializer(serializers.ModelSerializer):
         if not obj.share_enabled or not obj.share_token or not request:
             return None
         return request.build_absolute_uri(f"/api/videos/share/{obj.share_token}/")
+
+    def _get_feedback(self, obj):
+        return VideoFeedback.objects.filter(video=obj, user=obj.user).order_by("-updated_at").first()
+
+    def get_feedback_rating(self, obj):
+        feedback = self._get_feedback(obj)
+        return feedback.rating if feedback else None
+
+    def get_feedback_text(self, obj):
+        feedback = self._get_feedback(obj)
+        return feedback.comment if feedback else ""
+
+    def get_feedback_updated_at(self, obj):
+        feedback = self._get_feedback(obj)
+        return feedback.updated_at if feedback else None
 
 
 class VideoFeedbackSerializer(serializers.Serializer):

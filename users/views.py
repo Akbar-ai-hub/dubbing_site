@@ -45,6 +45,7 @@ class CurrentUserView(APIView):
             "username": user.username,
             "email": user.email,
             "balance": str(user.balance),
+            "created_at": user.created_at,
         })
 
 
