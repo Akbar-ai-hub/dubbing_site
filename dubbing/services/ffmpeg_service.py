@@ -25,6 +25,23 @@ class FFmpegService:
         ]
         self._run(command, "Failed to extract audio with ffmpeg")
 
+    def extract_thumbnail(self, input_video_path, output_image_path, at_sec=1.0):
+        at_sec = max(0.0, float(at_sec))
+        command = [
+            self.ffmpeg_bin,
+            "-y",
+            "-ss",
+            str(at_sec),
+            "-i",
+            input_video_path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            output_image_path,
+        ]
+        self._run(command, "Failed to extract video thumbnail")
+
     def mux_audio_with_video(self, input_video_path, input_audio_path, output_video_path):
         command = [
             self.ffmpeg_bin,

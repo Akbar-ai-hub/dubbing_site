@@ -21,6 +21,8 @@ class Video(models.Model):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="videos")
     original_video = models.FileField(upload_to="original_videos/")
+    duration = models.FloatField(blank=True, null=True)
+    thumbnail = models.FileField(upload_to="video_thumbnails/", blank=True, null=True)
     dubbed_video = models.FileField(upload_to="dubbed_videos/", blank=True, null=True)
     subtitle_srt = models.FileField(upload_to="dubbed_videos/", blank=True, null=True)
     share_enabled = models.BooleanField(default=False)

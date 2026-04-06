@@ -194,6 +194,9 @@ class VideoDeleteView(APIView):
         if video.original_video:
             video.original_video.delete(save=False)
 
+        if video.thumbnail:
+            video.thumbnail.delete(save=False)
+
         if video.dubbed_video:
             video.dubbed_video.delete(save=False)
 

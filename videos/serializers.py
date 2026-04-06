@@ -1,12 +1,17 @@
 import os
 import tempfile
+import logging
+import math
 
 from django.conf import settings
+from django.core.files import File
 from rest_framework import serializers
 
 from dubbing.services.ffmpeg_service import FFmpegService
 from dubbing.services.whisper_service import WhisperService
 from .models import Video, VideoFeedback
+
+logger = logging.getLogger(__name__)
 
 
 class VideoSerializer(serializers.ModelSerializer):
@@ -21,6 +26,8 @@ class VideoSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "original_video",
+            "duration",
+            "thumbnail",
             "dubbed_video",
             "subtitle_srt",
             "share_enabled",
@@ -37,6 +44,8 @@ class VideoSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "status",
             "progress_percent",
+            "duration",
+            "thumbnail",
             "feedback_rating",
             "feedback_text",
             "feedback_updated_at",
@@ -47,6 +56,11 @@ class VideoSerializer(serializers.ModelSerializer):
             "share_url",
             "error_message",
         ]
+
+    def create(self, validated_data):
+        video = super().create(validated_data)
+        self._populate_video_metadata(video)
+        return video
 
     def validate_original_video(self, file_obj):
         max_mb = int(getattr(settings, "MAX_UPLOAD_VIDEO_MB", 100))
@@ -111,6 +125,50 @@ class VideoSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     f"Original video language must be English. Detected: '{detected_language or 'unknown'}'."
                 )
+
+    def _populate_video_metadata(self, video):
+        video_path = getattr(video.original_video, "path", None)
+        if not video_path or not os.path.exists(video_path):
+            return
+
+        ffmpeg_bin = getattr(settings, "FFMPEG_BIN", "ffmpeg")
+        ffmpeg_service = FFmpegService(ffmpeg_bin=ffmpeg_bin)
+        update_fields = []
+        duration = None
+
+        try:
+            duration = float(ffmpeg_service.get_duration(video_path))
+            if not math.isfinite(duration) or duration <= 0:
+                duration = None
+        except Exception as exc:
+            logger.warning("Failed to detect video duration for Video #%s: %s", video.id, exc)
+
+        if duration is not None:
+            video.duration = round(duration, 3)
+            update_fields.append("duration")
+
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"video_thumb_{video.id}_") as tmp_dir:
+                thumbnail_path = os.path.join(tmp_dir, "thumbnail.jpg")
+                at_sec = 0.0
+                if duration and duration > 1:
+                    at_sec = min(duration * 0.1, 5.0)
+
+                ffmpeg_service.extract_thumbnail(
+                    input_video_path=video_path,
+                    output_image_path=thumbnail_path,
+                    at_sec=at_sec,
+                )
+
+                if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
+                    with open(thumbnail_path, "rb") as fp:
+                        video.thumbnail.save(f"video_{video.id}_thumb.jpg", File(fp), save=False)
+                    update_fields.append("thumbnail")
+        except Exception as exc:
+            logger.warning("Failed to generate thumbnail for Video #%s: %s", video.id, exc)
+
+        if update_fields:
+            video.save(update_fields=list(dict.fromkeys(update_fields)))
 
     def get_share_url(self, obj):
         request = self.context.get("request")
