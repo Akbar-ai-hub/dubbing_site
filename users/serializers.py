@@ -1,6 +1,7 @@
 import unicodedata
 from decimal import Decimal
 
+from django.conf import settings
 from rest_framework import serializers
 from .models import User, BillingTransaction
 from django.contrib.auth.password_validation import validate_password
@@ -65,6 +66,11 @@ class WalletTopUpSerializer(serializers.Serializer):
 
 
 class BillingTransactionSerializer(serializers.ModelSerializer):
+    currency = serializers.SerializerMethodField()
+
     class Meta:
         model = BillingTransaction
-        fields = ["id", "txn_type", "amount", "description", "video", "created_at"]
+        fields = ["id", "txn_type", "amount", "currency", "description", "video", "created_at"]
+
+    def get_currency(self, obj):
+        return str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()

@@ -3,6 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.contrib.auth import authenticate, get_user_model
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from google.auth.transport import requests
@@ -26,6 +27,7 @@ from .utils import generate_reset_code, send_reset_code
 
 User = get_user_model()
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+BILLING_CURRENCY = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
 
 
 def get_tokens_for_user(user):
@@ -45,6 +47,7 @@ class CurrentUserView(APIView):
             "username": user.username,
             "email": user.email,
             "balance": str(user.balance),
+            "currency": BILLING_CURRENCY,
             "created_at": user.created_at,
         })
 
@@ -68,6 +71,7 @@ class ProfileUpdateView(APIView):
                     "username": request.user.username,
                     "email": request.user.email,
                     "balance": str(request.user.balance),
+                    "currency": BILLING_CURRENCY,
                 },
             },
             status=status.HTTP_200_OK,
@@ -89,6 +93,7 @@ class ProfileUpdateView(APIView):
                     "username": request.user.username,
                     "email": request.user.email,
                     "balance": str(request.user.balance),
+                    "currency": BILLING_CURRENCY,
                 },
             },
             status=status.HTTP_200_OK,
@@ -110,6 +115,7 @@ class RegisterView(APIView):
                         "username": user.username,
                         "email": user.email,
                         "balance": str(user.balance),
+                        "currency": BILLING_CURRENCY,
                     },
                     "tokens": tokens,
                 },
@@ -147,6 +153,7 @@ class LoginView(APIView):
                     "username": user.username,
                     "email": user.email,
                     "balance": str(user.balance),
+                    "currency": BILLING_CURRENCY,
                 },
                 "tokens": tokens,
             },
@@ -186,6 +193,7 @@ class GoogleLoginView(APIView):
                     "username": user.username,
                     "email": user.email,
                     "balance": str(user.balance),
+                    "currency": BILLING_CURRENCY,
                 },
                 "tokens": tokens,
             },
@@ -308,7 +316,7 @@ class WalletBalanceView(APIView):
 
     def get(self, request):
         return Response(
-            {"balance": str(request.user.balance)},
+            {"balance": str(request.user.balance), "currency": BILLING_CURRENCY},
             status=status.HTTP_200_OK,
         )
 
@@ -329,11 +337,15 @@ class WalletTopUpView(APIView):
                 user=user,
                 txn_type=BillingTransaction.TYPE_TOP_UP,
                 amount=amount,
-                description="Manual top-up",
+                description=f"Manual top-up ({BILLING_CURRENCY})",
             )
 
         return Response(
-            {"message": "Balance topped up successfully", "balance": str(user.balance)},
+            {
+                "message": "Balance topped up successfully",
+                "balance": str(user.balance),
+                "currency": BILLING_CURRENCY,
+            },
             status=status.HTTP_200_OK,
         )
 

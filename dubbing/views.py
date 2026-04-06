@@ -55,11 +55,12 @@ class StartDubbingView(APIView):
 
         billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
         if billing_enabled:
-            min_balance = Decimal(str(getattr(settings, "BILLING_MIN_START_BALANCE", "0.10")))
+            billing_currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
+            min_balance = Decimal(str(getattr(settings, "BILLING_MIN_START_BALANCE", "100.00")))
             user_balance = Decimal(str(request.user.balance))
             if user_balance < min_balance:
                 return Response(
-                    {"error": f"Insufficient balance. Minimum required to start dubbing is {min_balance}."},
+                    {"error": f"Insufficient balance. Minimum required to start dubbing is {min_balance} {billing_currency}."},
                     status=status.HTTP_402_PAYMENT_REQUIRED,
                 )
 

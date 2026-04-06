@@ -28,25 +28,34 @@ def _to_decimal(value, default="0"):
         return Decimal(str(default))
 
 
-def _bill_video_usage(video, gpu_seconds):
+def _bill_video_usage(user_id, gpu_seconds, video_id=None, billing_reason="completed"):
     billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
     if not billing_enabled:
         return Decimal("0.00")
 
-    gpu_price_per_min = _to_decimal(getattr(settings, "GPU_PRICE_PER_MINUTE", "0.20"), "0.20")
-    storage_price_per_gb = _to_decimal(getattr(settings, "STORAGE_PRICE_PER_GB", "0.02"), "0.02")
+    currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
+    gpu_price_per_min = _to_decimal(getattr(settings, "GPU_PRICE_PER_MINUTE", "15.00"), "15.00")
+    storage_price_per_gb = _to_decimal(getattr(settings, "STORAGE_PRICE_PER_GB", "0.50"), "0.50")
 
     gpu_minutes = (Decimal(str(max(0.0, gpu_seconds))) / Decimal("60"))
     gpu_cost = (gpu_minutes * gpu_price_per_min)
 
-    total_bytes = 0
-    for f in [video.original_video, video.dubbed_video, video.subtitle_srt]:
-        if not f:
-            continue
+    video_obj = None
+    if video_id:
         try:
-            total_bytes += int(f.size)
-        except Exception:
-            pass
+            video_obj = Video.objects.get(id=video_id)
+        except Video.DoesNotExist:
+            video_obj = None
+
+    total_bytes = 0
+    if video_obj is not None:
+        for f in [video_obj.original_video, video_obj.dubbed_video, video_obj.subtitle_srt]:
+            if not f:
+                continue
+            try:
+                total_bytes += int(f.size)
+            except Exception:
+                pass
     storage_gb = (Decimal(str(total_bytes)) / Decimal(str(1024 ** 3)))
     storage_cost = storage_gb * storage_price_per_gb
 
@@ -55,7 +64,7 @@ def _bill_video_usage(video, gpu_seconds):
         return Decimal("0.00")
 
     with transaction.atomic():
-        user = User.objects.select_for_update().get(id=video.user_id)
+        user = User.objects.select_for_update().get(id=user_id)
         if Decimal(str(user.balance)) < total_cost:
             raise RuntimeError(
                 f"Insufficient balance for billing. Required={total_cost}, available={user.balance}."
@@ -64,11 +73,12 @@ def _bill_video_usage(video, gpu_seconds):
         user.save(update_fields=["balance"])
         BillingTransaction.objects.create(
             user=user,
-            video=video,
+            video=video_obj,
             txn_type=BillingTransaction.TYPE_DUBBING_CHARGE,
             amount=total_cost,
             description=(
-                f"Dubbing charge: gpu_minutes={gpu_minutes.quantize(Decimal('0.001'))}, "
+                f"Dubbing charge ({currency}, status={billing_reason}): "
+                f"gpu_minutes={gpu_minutes.quantize(Decimal('0.001'))}, "
                 f"gpu_cost={gpu_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}, "
                 f"storage_gb={storage_gb.quantize(Decimal('0.0001'))}, "
                 f"storage_cost={storage_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
@@ -126,6 +136,11 @@ def process_video_dubbing(video_id):
         video.error_message = "Original video is missing"
         video.save(update_fields=["status", "progress_percent", "error_message"])
         return {"error": "Original video is missing"}
+
+    user_id = video.user_id
+    billing_started = None
+    billing_reason = "completed"
+    result = {}
 
     try:
         _update_video_progress(video.id, 2, "initializing")
@@ -228,7 +243,6 @@ def process_video_dubbing(video_id):
                 output_video_path=output_video_path,
                 progress_callback=lambda percent, stage: _update_video_progress(video.id, percent, stage),
             )
-            billing_elapsed = max(0.0, time.monotonic() - billing_started)
 
             logger.info("Whisper transcript: %s", result.get("transcript_text"))
             logger.info("Translated text: %s", result.get("translated_text"))
@@ -242,13 +256,13 @@ def process_video_dubbing(video_id):
             if subtitle_path.exists():
                 video.subtitle_srt.name = f"dubbed_videos/{subtitle_basename}"
 
+        if not Video.objects.filter(id=video.id).exists():
+            raise RuntimeError("Video was deleted during processing.")
+
         video.status = Video.STATUS_COMPLETED
         video.progress_percent = 100
         video.error_message = ""
         video.save(update_fields=["dubbed_video", "subtitle_srt", "status", "progress_percent", "error_message"])
-
-        charged_amount = _bill_video_usage(video, gpu_seconds=billing_elapsed)
-        logger.info("Billing charged for video=%s amount=%s", video.id, charged_amount)
 
         _cleanup_stale_subtitles(video.id, keep_name=video.subtitle_srt.name if video.subtitle_srt else None)
 
@@ -264,8 +278,35 @@ def process_video_dubbing(video_id):
             "segments_count": result.get("segments_count"),
         }
     except Exception as exc:
-        video.status = Video.STATUS_FAILED
-        video.progress_percent = 0
-        video.error_message = str(exc)
-        video.save(update_fields=["status", "progress_percent", "error_message"])
-        return {"video_id": video.id, "status": video.status, "error": str(exc)}
+        billing_reason = "failed"
+        Video.objects.filter(id=video.id).update(
+            status=Video.STATUS_FAILED,
+            progress_percent=0,
+            error_message=str(exc),
+        )
+        return {"video_id": video.id, "status": Video.STATUS_FAILED, "error": str(exc)}
+    finally:
+        if billing_started is not None:
+            billing_elapsed = max(0.0, time.monotonic() - billing_started)
+            try:
+                charged_amount = _bill_video_usage(
+                    user_id=user_id,
+                    gpu_seconds=billing_elapsed,
+                    video_id=video_id,
+                    billing_reason=billing_reason,
+                )
+                logger.info(
+                    "Billing charged for video=%s amount=%s reason=%s elapsed_sec=%.3f",
+                    video_id,
+                    charged_amount,
+                    billing_reason,
+                    billing_elapsed,
+                )
+            except Exception as bill_exc:
+                logger.exception(
+                    "Billing failed for video=%s reason=%s elapsed_sec=%.3f: %s",
+                    video_id,
+                    billing_reason,
+                    billing_elapsed,
+                    bill_exc,
+                )
