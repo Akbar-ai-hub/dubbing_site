@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Video, VideoFeedback
-from .serializers import VideoSerializer, VideoFeedbackSerializer
+from .serializers import VideoSerializer, VideoFeedbackSerializer, VideoFeedbackListItemSerializer
 
 
 # ---------------------------
@@ -323,3 +323,16 @@ class VideoFeedbackView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class VideoFeedbackListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        feedbacks = (
+            VideoFeedback.objects
+            .select_related("video", "user")
+            .order_by("-updated_at")
+        )
+        serializer = VideoFeedbackListItemSerializer(feedbacks, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)

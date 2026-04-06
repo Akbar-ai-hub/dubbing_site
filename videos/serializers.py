@@ -195,3 +195,22 @@ class VideoSerializer(serializers.ModelSerializer):
 class VideoFeedbackSerializer(serializers.Serializer):
     rating = serializers.IntegerField(min_value=1, max_value=5)
     comment = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class VideoFeedbackListItemSerializer(serializers.ModelSerializer):
+    video_id = serializers.IntegerField(source="video.id", read_only=True)
+    video_status = serializers.CharField(source="video.status", read_only=True)
+    username = serializers.CharField(source="user.username", read_only=True)
+
+    class Meta:
+        model = VideoFeedback
+        fields = [
+            "id",
+            "video_id",
+            "video_status",
+            "username",
+            "rating",
+            "comment",
+            "created_at",
+            "updated_at",
+        ]

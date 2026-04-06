@@ -9,6 +9,7 @@ from .views import (
     ShareDubbedVideoView,
     SharedDubbedVideoAccessView,
     VideoFeedbackView,
+    VideoFeedbackListView,
 )
 
 urlpatterns = [
@@ -19,6 +20,7 @@ urlpatterns = [
     path("<int:video_id>/delete/", VideoDeleteView.as_view()),
     path("<int:video_id>/share/", ShareDubbedVideoView.as_view()),
     path("<int:video_id>/feedback/", VideoFeedbackView.as_view()),
+    path("feedbacks/", VideoFeedbackListView.as_view()),
     path("share/<str:token>/", SharedDubbedVideoAccessView.as_view()),
     path("<int:video_id>/download-dubbed/", DubbedVideoDownloadView.as_view()),
 ]
