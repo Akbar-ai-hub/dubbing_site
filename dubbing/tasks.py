@@ -9,10 +9,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from celery import shared_task
 from django.conf import settings
 from django.core.files.base import File
+from django.core.mail import send_mail
 from django.db import transaction
 
 from videos.models import Video
-from users.models import BillingTransaction, User
+from users.models import BillingTransaction, User, NotificationPreference, UserNotification
 
 from .services import DubbingPipelineService
 
@@ -92,6 +93,49 @@ def _update_video_progress(video_id, percent, stage=None):
     Video.objects.filter(id=video_id).update(progress_percent=clamped)
     if stage:
         logger.info("Dubbing progress video=%s %s%% stage=%s", video_id, clamped, stage)
+
+
+def _create_dubbing_notification(user_id, video_id, is_success, error_message=""):
+    try:
+        user = User.objects.get(id=user_id)
+        preferences, _ = NotificationPreference.objects.get_or_create(user_id=user_id)
+        if not preferences.notify_completed:
+            return
+
+        if is_success:
+            title = "Dubbing completed"
+            message = f"Your video #{video_id} has been dubbed successfully."
+            notification_type = UserNotification.TYPE_DUBBING_COMPLETED
+        else:
+            title = "Dubbing failed"
+            suffix = f" Error: {error_message}" if error_message else ""
+            message = f"Your video #{video_id} dubbing failed.{suffix}"
+            notification_type = UserNotification.TYPE_DUBBING_FAILED
+
+        UserNotification.objects.create(
+            user_id=user_id,
+            video_id=video_id,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+        )
+
+        if preferences.notify_email and user.email:
+            subject = title
+            email_message = (
+                f"Hello {user.username},\n\n"
+                f"{message}\n\n"
+                "Video Dubbing Service"
+            )
+            send_mail(
+                subject=subject,
+                message=email_message,
+                from_email=getattr(settings, "EMAIL_HOST_USER", None),
+                recipient_list=[user.email],
+                fail_silently=True,
+            )
+    except Exception as exc:
+        logger.warning("Failed to create user notification for video=%s: %s", video_id, exc)
 
 
 def _cleanup_stale_subtitles(video_id, keep_name=None):
@@ -271,6 +315,8 @@ def process_video_dubbing(video_id):
         if old_subtitle_name and video.subtitle_srt and old_subtitle_name != video.subtitle_srt.name:
             video.subtitle_srt.storage.delete(old_subtitle_name)
 
+        _create_dubbing_notification(user_id=user_id, video_id=video.id, is_success=True)
+
         return {
             "video_id": video.id,
             "status": video.status,
@@ -278,13 +324,15 @@ def process_video_dubbing(video_id):
             "segments_count": result.get("segments_count"),
         }
     except Exception as exc:
+        error_text = str(exc)
         billing_reason = "failed"
         Video.objects.filter(id=video.id).update(
             status=Video.STATUS_FAILED,
             progress_percent=0,
-            error_message=str(exc),
+            error_message=error_text,
         )
-        return {"video_id": video.id, "status": Video.STATUS_FAILED, "error": str(exc)}
+        _create_dubbing_notification(user_id=user_id, video_id=video.id, is_success=False, error_message=error_text)
+        return {"video_id": video.id, "status": Video.STATUS_FAILED, "error": error_text}
     finally:
         if billing_started is not None:
             billing_elapsed = max(0.0, time.monotonic() - billing_started)

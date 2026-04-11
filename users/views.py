@@ -14,8 +14,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 
-from .models import BillingTransaction, PasswordResetCode
-from .serializers import BillingTransactionSerializer, RegisterSerializer, WalletTopUpSerializer
+from .models import BillingTransaction, PasswordResetCode, NotificationPreference, UserNotification
+from .serializers import (
+    BillingTransactionSerializer,
+    NotificationPreferenceSerializer,
+    RegisterSerializer,
+    UserNotificationSerializer,
+    WalletTopUpSerializer,
+)
 from .throttles import (
     LoginThrottle,
     PasswordResetCompleteThrottle,
@@ -357,3 +363,60 @@ class BillingHistoryView(APIView):
         transactions = BillingTransaction.objects.filter(user=request.user).select_related("video")[:200]
         serializer = BillingTransactionSerializer(transactions, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class NotificationPreferenceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        preferences, _ = NotificationPreference.objects.get_or_create(user=request.user)
+        serializer = NotificationPreferenceSerializer(preferences)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request):
+        preferences, _ = NotificationPreference.objects.get_or_create(user=request.user)
+        serializer = NotificationPreferenceSerializer(preferences, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class NotificationListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        notifications = (
+            UserNotification.objects
+            .filter(user=request.user)
+            .order_by("-created_at")[:100]
+        )
+        serializer = UserNotificationSerializer(notifications, many=True)
+        unread_count = UserNotification.objects.filter(user=request.user, is_read=False).count()
+        return Response(
+            {
+                "results": serializer.data,
+                "unread_count": unread_count,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class NotificationReadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        notification_id = request.data.get("notification_id")
+
+        queryset = UserNotification.objects.filter(user=request.user, is_read=False)
+        if notification_id:
+            queryset = queryset.filter(id=notification_id)
+
+        updated = queryset.update(is_read=True, read_at=timezone.now())
+        unread_count = UserNotification.objects.filter(user=request.user, is_read=False).count()
+        return Response(
+            {
+                "updated_count": int(updated),
+                "unread_count": unread_count,
+            },
+            status=status.HTTP_200_OK,
+        )

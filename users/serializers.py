@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from rest_framework import serializers
-from .models import User, BillingTransaction
+from .models import User, BillingTransaction, NotificationPreference, UserNotification
 from django.contrib.auth.password_validation import validate_password
 from django.utils.html import strip_tags
 
@@ -74,3 +74,22 @@ class BillingTransactionSerializer(serializers.ModelSerializer):
 
     def get_currency(self, obj):
         return str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
+
+
+class NotificationPreferenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NotificationPreference
+        fields = ["notify_email", "notify_completed", "notify_marketing"]
+
+
+class UserNotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserNotification
+        fields = [
+            "id",
+            "title",
+            "message",
+            "notification_type",
+            "is_read",
+            "created_at",
+        ]

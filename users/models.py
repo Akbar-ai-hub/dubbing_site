@@ -72,4 +72,58 @@ class BillingTransaction(models.Model):
         return f"{self.user_id} {self.txn_type} {self.amount}"
 
 
+class NotificationPreference(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notification_preferences",
+    )
+    notify_email = models.BooleanField(default=True)
+    notify_completed = models.BooleanField(default=True)
+    notify_marketing = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"NotificationPreference(user={self.user_id})"
+
+
+class UserNotification(models.Model):
+    TYPE_DUBBING_COMPLETED = "dubbing_completed"
+    TYPE_DUBBING_FAILED = "dubbing_failed"
+    TYPE_BILLING = "billing"
+    TYPE_SYSTEM = "system"
+
+    TYPE_CHOICES = [
+        (TYPE_DUBBING_COMPLETED, "Dubbing Completed"),
+        (TYPE_DUBBING_FAILED, "Dubbing Failed"),
+        (TYPE_BILLING, "Billing"),
+        (TYPE_SYSTEM, "System"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+    )
+    video = models.ForeignKey(
+        "videos.Video",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="notifications",
+    )
+    notification_type = models.CharField(max_length=32, choices=TYPE_CHOICES, default=TYPE_SYSTEM)
+    title = models.CharField(max_length=200)
+    message = models.TextField(blank=True)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    read_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"UserNotification(user={self.user_id}, type={self.notification_type}, read={self.is_read})"
+
+
 # Create your models here.

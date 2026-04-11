@@ -12,6 +12,9 @@ from .views import (
     WalletBalanceView,
     WalletTopUpView,
     BillingHistoryView,
+    NotificationPreferenceView,
+    NotificationListView,
+    NotificationReadView,
 )
 
 urlpatterns = [
@@ -27,4 +30,7 @@ urlpatterns = [
     path('wallet/', WalletBalanceView.as_view(), name='wallet-balance'),
     path('wallet/top-up/', WalletTopUpView.as_view(), name='wallet-top-up'),
     path('wallet/transactions/', BillingHistoryView.as_view(), name='wallet-transactions'),
+    path('profile/notifications/', NotificationPreferenceView.as_view(), name='notification-preferences'),
+    path('notifications/', NotificationListView.as_view(), name='notifications-list'),
+    path('notifications/read/', NotificationReadView.as_view(), name='notifications-read'),
 ]
