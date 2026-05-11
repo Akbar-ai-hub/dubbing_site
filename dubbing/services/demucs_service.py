@@ -51,6 +51,19 @@ class DemucsService:
             raise RuntimeError(f"Demucs vocals output not found: {vocals_path}")
         return str(vocals_path)
 
+    def separate_vocals_and_background(self, input_audio_path, output_dir):
+        """
+        Runs demucs once and returns both vocals and background stems.
+        """
+        base = self._separate(input_audio_path, output_dir)
+        vocals_path = base / "vocals.wav"
+        bg_path = base / "no_vocals.wav"
+        if not vocals_path.exists():
+            raise RuntimeError(f"Demucs vocals output not found: {vocals_path}")
+        if not bg_path.exists():
+            raise RuntimeError(f"Demucs background output not found: {bg_path}")
+        return str(vocals_path), str(bg_path)
+
     def separate_background(self, input_audio_path, output_dir):
         """
         Runs demucs to extract non-vocals (background) stem.

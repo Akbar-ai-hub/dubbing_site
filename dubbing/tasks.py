@@ -215,6 +215,7 @@ def process_video_dubbing(video_id):
         xtts_repetition_penalty = float(_get_setting("XTTS_REPETITION_PENALTY", 3.0))
         xtts_top_k = int(_get_setting("XTTS_TOP_K", 50))
         xtts_top_p = float(_get_setting("XTTS_TOP_P", 0.9))
+        min_segment_chars = int(_get_setting("MIN_SEGMENT_CHARS", 35))
         max_merge_chars = int(_get_setting("MAX_MERGE_CHARS", 220))
         speaker_embedding_model_name = _get_setting("SPEAKER_EMBEDDING_MODEL_NAME", "pyannote/embedding")
         # Backward-compat: if SPEAKER_EMBEDDING_MODEL_DIR is set to ...\\hub\\models--...,
@@ -258,6 +259,7 @@ def process_video_dubbing(video_id):
             xtts_repetition_penalty=xtts_repetition_penalty,
             xtts_top_k=xtts_top_k,
             xtts_top_p=xtts_top_p,
+            min_segment_chars=min_segment_chars,
             max_merge_chars=max_merge_chars,
             speaker_embedding_model_name=speaker_embedding_model_name,
             speaker_embedding_cache_dir=(speaker_embedding_cache_dir or None),
