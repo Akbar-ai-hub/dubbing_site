@@ -263,6 +263,7 @@ def process_video_dubbing(video_id):
             max_merge_chars=max_merge_chars,
             speaker_embedding_model_name=speaker_embedding_model_name,
             speaker_embedding_cache_dir=(speaker_embedding_cache_dir or None),
+            speaker_embedding_model_dir=(legacy_model_dir or None),
             speaker_embedding_device=(speaker_embedding_device or None),
             ref_audio_output_dir=str(Path(settings.MEDIA_ROOT) / "dubbed_videos"),
             subtitle_basename=subtitle_basename,

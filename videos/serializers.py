@@ -2,6 +2,7 @@ import os
 import tempfile
 import logging
 import math
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.core.files import File
@@ -82,10 +83,74 @@ class VideoSerializer(serializers.ModelSerializer):
                 f"Unsupported content type '{content_type}'. Allowed: {allowed_values}."
             )
 
+        duration = self._probe_duration(file_obj)
+        self._validate_user_can_afford_upload(duration)
+
         if getattr(settings, "VALIDATE_ORIGINAL_VIDEO_ENGLISH", False):
             self._validate_english_language(file_obj)
 
         return file_obj
+
+    def _validate_user_can_afford_upload(self, duration_sec):
+        billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        if not billing_enabled:
+            return
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            return
+
+        required_amount = self._estimate_required_balance(duration_sec)
+        user_balance = Decimal(str(getattr(user, "balance", "0")))
+        if user_balance >= required_amount:
+            return
+
+        billing_currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
+        raise serializers.ValidationError(
+            "Insufficient balance for this video. "
+            f"Estimated dubbing cost with safety margin is {required_amount} {billing_currency}, "
+            f"but your balance is {user_balance} {billing_currency}."
+        )
+
+    def _estimate_required_balance(self, duration_sec):
+        gpu_price_per_min = self._to_decimal(getattr(settings, "2000.00", "15.00"), "15.00")
+        duration_minutes = Decimal(str(max(0.0, float(duration_sec)))) / Decimal("60")
+        base_cost = duration_minutes * gpu_price_per_min
+        safety_multiplier = Decimal("1.20")
+        return (base_cost * safety_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _probe_duration(self, file_obj):
+        ffmpeg_bin = getattr(settings, "FFMPEG_BIN", "ffmpeg")
+        source_name = os.path.basename(getattr(file_obj, "name", "") or "upload.mp4")
+        suffix = os.path.splitext(source_name)[1] or ".mp4"
+
+        with tempfile.TemporaryDirectory(prefix="video_duration_check_") as tmp_dir:
+            video_path = os.path.join(tmp_dir, f"source{suffix}")
+            with open(video_path, "wb") as output_file:
+                for chunk in file_obj.chunks():
+                    output_file.write(chunk)
+
+            ffmpeg_service = FFmpegService(ffmpeg_bin=ffmpeg_bin)
+            try:
+                duration = float(ffmpeg_service.get_duration(video_path))
+            except Exception as exc:
+                raise serializers.ValidationError(f"Failed to read video duration: {exc}") from exc
+            finally:
+                try:
+                    file_obj.seek(0)
+                except Exception:
+                    pass
+
+        if not math.isfinite(duration) or duration <= 0:
+            raise serializers.ValidationError("Video duration could not be determined.")
+        return duration
+
+    def _to_decimal(self, value, default="0"):
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal(str(default))
 
     def _validate_english_language(self, file_obj):
         ffmpeg_bin = getattr(settings, "FFMPEG_BIN", "ffmpeg")

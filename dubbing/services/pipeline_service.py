@@ -3,12 +3,10 @@ import re
 import textwrap
 from pathlib import Path
 
-import numpy as np
-
 from .demucs_service import DemucsService
 from .ffmpeg_service import FFmpegService
 from .prosody_service import ProsodyDurationMapperService
-from .speaker_service import SpeakerEmbeddingService, cosine_similarity
+from .speaker_service import SpeakerAttributionService, SpeakerEmbeddingService
 from .translation_service import LocalNLLBTranslationService
 from .tts_service import CoquiTTSService
 from .whisper_service import WhisperService
@@ -18,20 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 class DubbingPipelineService:
-    """
-    Current pipeline behavior:
-    1) Extract audio from video.
-    2) Run Demucs once to split vocals/background.
-    3) Send the clean vocals track to Whisper and collect timestamped segments.
-    4) Translate each Whisper segment independently.
-    5) Build an SRT file from the segment timestamps and translated text.
-    6) Extract per-segment reference audio from the clean vocals track.
-    7) Run XTTS for each segment using the translated text + that segment audio as reference.
-    8) Fit each synthesized segment into its original time window and mix on the timeline.
-    9) Add the separated background back at -20 dB.
-    10) Mux the final audio back into the source video.
-    """
-
     def __init__(
         self,
         ffmpeg_bin="ffmpeg",
@@ -66,6 +50,7 @@ class DubbingPipelineService:
         speaker_ref_min_segment_seconds=0.75,
         speaker_embedding_model_name="pyannote/embedding",
         speaker_embedding_cache_dir=None,
+        speaker_embedding_model_dir=None,
         speaker_embedding_min_seconds=2.0,
         speaker_embedding_device=None,
         min_segment_chars=35,
@@ -76,13 +61,6 @@ class DubbingPipelineService:
         self.ffmpeg = FFmpegService(ffmpeg_bin=ffmpeg_bin)
         self.demucs = DemucsService()
         self.whisper = WhisperService(model_name=whisper_model_name, api_key=groq_api_key)
-        self.speaker_embedding = SpeakerEmbeddingService(
-            model_name=speaker_embedding_model_name,
-            cache_dir=speaker_embedding_cache_dir,
-            auth_token=hf_auth_token,
-            device=speaker_embedding_device,
-            local_files_only=True,
-        )
         self.translation = LocalNLLBTranslationService(
             model_dir=translation_model_dir,
             source_lang=nllb_source_lang,
@@ -103,6 +81,26 @@ class DubbingPipelineService:
             min_tempo_factor=min_tempo_factor,
             max_tempo_factor=max_tempo_factor,
         )
+        self.speaker_embedding = SpeakerEmbeddingService(
+            model_name=speaker_embedding_model_name,
+            cache_dir=speaker_embedding_cache_dir,
+            model_dir=speaker_embedding_model_dir,
+            auth_token=hf_auth_token,
+            device=speaker_embedding_device,
+            local_files_only=True,
+        )
+        preferred_speakers = None
+        try:
+            if str(diarization_max_speakers).strip():
+                preferred_speakers = int(diarization_max_speakers)
+        except Exception:
+            preferred_speakers = None
+        self.speaker_attribution = SpeakerAttributionService(
+            embedding_service=self.speaker_embedding,
+            auth_token=hf_auth_token,
+            default_num_speakers=preferred_speakers,
+        )
+
         self.source_language_name = source_language_name
         self.target_language_name = target_language_name
         self.source_language = source_language
@@ -136,6 +134,7 @@ class DubbingPipelineService:
             extracted_audio_path,
             demucs_out,
         )
+        self._persist_clean_vocals(vocals_path)
 
         self._emit_progress(progress_callback, 28, "transcription")
         asr = self.whisper.transcribe(vocals_path, language=self.source_language)
@@ -143,12 +142,12 @@ class DubbingPipelineService:
         words = self._normalize_word_timestamps(asr.get("words") or [], total_duration)
         if not words:
             raise RuntimeError("Whisper returned no usable word timestamps")
+
         whisper_raw_segments = self._normalize_whisper_segments(asr.get("segments") or [], total_duration)
-        whisper_segments = self._regroup_words_into_segments(
-            words,
-            total_duration,
+        whisper_segments = self._build_sentence_segments(
+            words=words,
+            total_duration=total_duration,
             vocals_path=vocals_path,
-            work_dir=work_dir,
             whisper_raw_segments=whisper_raw_segments,
         )
         if not whisper_segments:
@@ -195,6 +194,8 @@ class DubbingPipelineService:
                 input_audio_path=seg_tts_path,
                 output_audio_path=seg_mapped_path,
                 target_duration_sec=item["duration_sec"],
+                source_prosody=item.get("source_prosody"),
+                transcript_text=item.get("text") or translated,
             )
             timeline_segments.append({"path": seg_mapped_path, "start": item["start"]})
 
@@ -245,7 +246,6 @@ class DubbingPipelineService:
     def _normalize_word_timestamps(self, raw_words, total_duration):
         normalized = []
         total_duration = max(0.1, float(total_duration))
-
         for word in raw_words:
             if not isinstance(word, dict):
                 continue
@@ -257,11 +257,9 @@ class DubbingPipelineService:
                 end = min(total_duration, float(word.get("end", 0.0)))
             except (TypeError, ValueError):
                 continue
-
             if end <= start:
                 continue
             normalized.append({"word": text, "start": start, "end": end})
-
         return normalized
 
     def _normalize_whisper_segments(self, raw_segments, total_duration):
@@ -283,7 +281,7 @@ class DubbingPipelineService:
             normalized.append({"id": idx, "start": start, "end": end, "text": text})
         return normalized
 
-    def _regroup_words_into_segments(self, words, total_duration, vocals_path, work_dir, whisper_raw_segments=None):
+    def _build_sentence_segments(self, words, total_duration, vocals_path, whisper_raw_segments=None):
         whisper_raw_segments = whisper_raw_segments or []
         units = []
         current = None
@@ -295,14 +293,16 @@ class DubbingPipelineService:
             if current is None:
                 current = self._start_unit(item)
                 continue
+
             tentative_text = self._join_token(current["text"], item["word"])
             gap = max(0.0, float(item["start"]) - float(current["end"]))
             should_split = False
             if sentence_end_re.search(current["text"]):
                 should_split = True
-            elif len(tentative_text) > self.max_chars and len(current["text"]) >= self.min_chars:
+            elif gap >= 0.60:
+                # Large pauses should always start a new segment, even for short utterances.
                 should_split = True
-            elif gap >= 0.85 and len(current["text"]) >= self.min_chars:
+            elif len(tentative_text) > self.max_chars and len(current["text"]) >= self.min_chars:
                 should_split = True
 
             if should_split:
@@ -315,7 +315,10 @@ class DubbingPipelineService:
             current["words"].append(item)
 
         self._finalize_unit(units, current)
-        speaker_labeled_units = self._assign_unit_speakers_with_embeddings(units, vocals_path, work_dir)
+        speaker_labeled_units = self.speaker_attribution.assign_speakers(
+            segments=units,
+            audio_path=vocals_path,
+        )
         merged = self._merge_short_units(speaker_labeled_units)
         logger.info("Regrouped %d words into %d segments", len(words), len(merged))
         for idx, segment in enumerate(merged):
@@ -329,70 +332,27 @@ class DubbingPipelineService:
             )
         return self._normalize_regrouped_segments(merged, total_duration)
 
-    def _assign_unit_speakers_with_embeddings(self, units, vocals_path, work_dir):
-        if not units:
-            return []
+    def _persist_clean_vocals(self, vocals_path):
+        if not self.ref_audio_output_dir:
+            return
 
-        emb_items = []
-        for idx, unit in enumerate(units):
-            duration = max(0.0, float(unit["end"]) - float(unit["start"]))
-            embed_path = str(Path(work_dir) / f"embed_unit_{idx:04d}.wav")
-            self.ffmpeg.extract_audio_segment(
-                input_audio_path=vocals_path,
-                output_audio_path=embed_path,
-                start_sec=float(unit["start"]),
-                end_sec=float(unit["end"]),
-            )
-            try:
-                emb = self.speaker_embedding.embed(embed_path)
-            finally:
-                Path(embed_path).unlink(missing_ok=True)
-            emb_items.append(
-                {
-                    "index": idx,
-                    "embedding": emb,
-                    "start": float(unit["start"]),
-                    "duration_sec": duration,
-                }
-            )
+        src = Path(vocals_path)
+        if not src.exists():
+            return
 
-        target_clusters = self._estimate_speaker_cluster_count(emb_items)
-        assignments = self._cluster_speaker_embeddings(emb_items, target_clusters)
-        cluster_order = []
-        for unit_idx, cluster_idx in sorted(assignments.items(), key=lambda pair: units[pair[0]]["start"]):
-            if cluster_idx not in cluster_order:
-                cluster_order.append(cluster_idx)
-        cluster_to_name = {cluster_idx: f"SPEAKER_{order:02d}" for order, cluster_idx in enumerate(cluster_order)}
-        logger.info("Embedding-based sentence speaker assignment: %s", cluster_to_name)
-
-        assigned_units = []
-        for idx, unit in enumerate(units):
-            cluster_idx = assignments.get(idx, 0)
-            assigned = dict(unit)
-            assigned["speaker"] = cluster_to_name.get(cluster_idx, f"SPEAKER_{cluster_idx:02d}")
-            logger.info(
-                "Sentence unit start=%.3f end=%.3f speaker=%s cluster=%s text=%s",
-                float(assigned.get("start", 0.0)),
-                float(assigned.get("end", 0.0)),
-                assigned["speaker"],
-                cluster_idx,
-                assigned.get("text") or "",
-            )
-            assigned_units.append(assigned)
-        return assigned_units
-
-    def _estimate_speaker_cluster_count(self, emb_items):
-        if len(emb_items) <= 1:
-            return 1
-        vectors = [self._normalize_embedding(item["embedding"]) for item in emb_items]
-        similarities = []
-        for idx in range(len(vectors)):
-            for jdx in range(idx + 1, len(vectors)):
-                similarities.append(cosine_similarity(vectors[idx], vectors[jdx]))
-        if not similarities:
-            return 1
-        min_similarity = min(similarities)
-        return 2 if min_similarity < 0.80 else 1
+        out_dir = Path(self.ref_audio_output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base_name = "clean_vocals.wav"
+        if self.subtitle_basename:
+            subtitle_name = Path(self.subtitle_basename).name
+            if subtitle_name.lower().endswith(".srt"):
+                base_name = subtitle_name[:-4] + "_clean_vocals.wav"
+        dest = out_dir / base_name
+        try:
+            dest.write_bytes(src.read_bytes())
+            logger.info("Clean vocals audio copied to: %s", dest)
+        except Exception as exc:
+            logger.warning("Failed to persist clean vocals audio %s: %s", src, exc)
 
     def _resolve_source_segment_id(self, word, whisper_raw_segments):
         if not whisper_raw_segments:
@@ -486,7 +446,10 @@ class DubbingPipelineService:
             "start": float(left["start"]),
             "end": float(right["end"]),
             "text": self._join_token(left["text"], right["text"]),
-            "words": list(left["words"]) + list(right["words"]),
+            "words": list(left.get("words") or []) + list(right.get("words") or []),
+            "source_segment_ids": sorted(
+                set(left.get("source_segment_ids") or []) | set(right.get("source_segment_ids") or [])
+            ),
         }
 
     def _normalize_regrouped_segments(self, segments, total_duration):
@@ -554,6 +517,10 @@ class DubbingPipelineService:
                 output_audio_path=ref_22050_path,
                 sample_rate_hz=22050,
             )
+            source_prosody = self.prosody.analyze_source_segment(
+                input_audio_path=raw_ref_path,
+                transcript_text=segment.get("text") or "",
+            )
 
             items.append(
                 {
@@ -565,66 +532,16 @@ class DubbingPipelineService:
                     "char_count": int(segment.get("char_count") or 0),
                     "reference_path": ref_22050_path,
                     "source_reference_path": ref_22050_path,
+                    "source_prosody": source_prosody,
                 }
             )
 
         self._assign_reference_fallbacks(items)
         return items
 
-    def _cluster_speaker_embeddings(self, emb_items, target_clusters):
-        if not emb_items:
-            return {}
-
-        vectors = [self._normalize_embedding(item["embedding"]) for item in emb_items]
-        k = max(1, min(int(target_clusters), len(vectors)))
-        seed_indexes = [max(range(len(emb_items)), key=lambda idx: emb_items[idx]["duration_sec"])]
-        while len(seed_indexes) < k:
-            best_idx = None
-            best_distance = None
-            for idx, vector in enumerate(vectors):
-                if idx in seed_indexes:
-                    continue
-                min_similarity = max(cosine_similarity(vector, vectors[seed_idx]) for seed_idx in seed_indexes)
-                distance = 1.0 - min_similarity
-                if best_distance is None or distance > best_distance:
-                    best_distance = distance
-                    best_idx = idx
-            if best_idx is None:
-                break
-            seed_indexes.append(best_idx)
-
-        centroids = [vectors[idx].copy() for idx in seed_indexes]
-        assignments = {}
-        for _ in range(12):
-            updated_assignments = {}
-            for idx, vector in enumerate(vectors):
-                scores = [cosine_similarity(vector, centroid) for centroid in centroids]
-                updated_assignments[idx] = int(max(range(len(scores)), key=lambda cluster_idx: scores[cluster_idx]))
-            if updated_assignments == assignments:
-                break
-            assignments = updated_assignments
-
-            new_centroids = []
-            for cluster_idx in range(len(centroids)):
-                members = [vectors[idx] for idx, assigned in assignments.items() if assigned == cluster_idx]
-                if not members:
-                    new_centroids.append(centroids[cluster_idx])
-                    continue
-                mean_vec = np.mean(np.stack(members, axis=0), axis=0)
-                new_centroids.append(self._normalize_embedding(mean_vec))
-            centroids = new_centroids
-
-        return {emb_items[idx]["index"]: cluster_idx for idx, cluster_idx in assignments.items()}
-
-    def _normalize_embedding(self, vector):
-        arr = np.asarray(vector, dtype="float32").reshape(-1)
-        norm = np.linalg.norm(arr) + 1e-8
-        return arr / norm
-
     def _assign_reference_fallbacks(self, segment_items):
         if not segment_items:
             return
-
         strong_candidates = [item for item in segment_items if item["char_count"] >= self.min_chars]
         for idx, item in enumerate(segment_items):
             if item["char_count"] >= self.min_chars:
