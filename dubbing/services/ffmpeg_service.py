@@ -63,11 +63,12 @@ class FFmpegService:
         ]
         self._run(command, "Failed to merge dubbed audio with video")
 
-    def extract_audio_segment(self, input_audio_path, output_audio_path, start_sec, end_sec):
+    def extract_audio_segment(self, input_audio_path, output_audio_path, start_sec, end_sec, sample_rate_hz=16000):
         duration = max(0.0, float(end_sec) - float(start_sec))
         if duration <= 0:
             raise RuntimeError("Invalid segment duration for audio extraction")
 
+        sample_rate_hz = int(sample_rate_hz)
         command = [
             self.ffmpeg_bin,
             "-y",
@@ -80,7 +81,7 @@ class FFmpegService:
             "-acodec",
             "pcm_s16le",
             "-ar",
-            "16000",
+            str(sample_rate_hz),
             "-ac",
             "1",
             output_audio_path,
@@ -155,9 +156,10 @@ class FFmpegService:
         ]
         self._run(command, "Failed to normalize audio duration")
 
-    def denoise_audio(self, input_audio_path, output_audio_path, strength_db=-25):
+    def denoise_audio(self, input_audio_path, output_audio_path, strength_db=-25, sample_rate_hz=16000):
         # Lightweight noise reduction for speaker embedding stability.
         strength_db = float(strength_db)
+        sample_rate_hz = int(sample_rate_hz)
         command = [
             self.ffmpeg_bin,
             "-y",
@@ -168,7 +170,7 @@ class FFmpegService:
             "-acodec",
             "pcm_s16le",
             "-ar",
-            "16000",
+            str(sample_rate_hz),
             "-ac",
             "1",
             output_audio_path,
@@ -267,11 +269,12 @@ class FFmpegService:
         ]
         self._run(command, "Failed to mix background audio")
 
-    def concat_audio_files(self, input_audio_paths, output_audio_path):
+    def concat_audio_files(self, input_audio_paths, output_audio_path, sample_rate_hz=16000):
         paths = [str(p) for p in (input_audio_paths or []) if p]
         if not paths:
             raise RuntimeError("No input audio files provided for concatenation")
 
+        sample_rate_hz = int(sample_rate_hz)
         output_path = str(output_audio_path)
         list_file = None
         try:
@@ -294,7 +297,7 @@ class FFmpegService:
                 "-acodec",
                 "pcm_s16le",
                 "-ar",
-                "16000",
+                str(sample_rate_hz),
                 "-ac",
                 "1",
                 output_path,

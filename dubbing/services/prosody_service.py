@@ -26,6 +26,7 @@ class ProsodyDurationMapperService:
         energy_db = self._estimate_rms_db(samples)
         pause_profile = self._estimate_pause_profile(samples, sample_rate)
         pitch_profile = self._estimate_pitch_profile(samples, sample_rate)
+        energy_contour_db = self._estimate_energy_contour(samples, sample_rate)
 
         voiced_duration = max(0.05, duration_sec - pause_profile["total_silence_sec"])
         speaking_rate_wps = words / voiced_duration if words > 0 else 0.0
@@ -39,10 +40,13 @@ class ProsodyDurationMapperService:
             "leading_silence_sec": float(pause_profile["leading_silence_sec"]),
             "trailing_silence_sec": float(pause_profile["trailing_silence_sec"]),
             "longest_pause_sec": float(pause_profile["longest_pause_sec"]),
+            "pause_positions": list(pause_profile.get("pause_positions") or []),
+            "energy_contour_db": list(energy_contour_db),
             "pitch_mean_hz": float(pitch_profile["pitch_mean_hz"]),
             "pitch_range_hz": float(pitch_profile["pitch_range_hz"]),
             "pitch_slope_hz_per_sec": float(pitch_profile["pitch_slope_hz_per_sec"]),
             "pitch_std_hz": float(pitch_profile["pitch_std_hz"]),
+            "pitch_contour_hz": list(pitch_profile.get("pitch_contour_hz") or []),
         }
         logger.info("Source prosody profile: %s", profile)
         return profile
@@ -111,6 +115,8 @@ class ProsodyDurationMapperService:
         samples, sample_rate = self._load_audio(input_audio_path)
         target_samples = max(1, int(round(float(target_duration_sec) * sample_rate)))
         samples = self._apply_energy_match(samples, source_prosody)
+        samples = self._apply_energy_contour(samples, sample_rate, source_prosody)
+        samples = self._apply_pitch_expression_proxy(samples, sample_rate, source_prosody)
 
         if len(samples) > target_samples:
             samples = samples[:target_samples]
@@ -126,6 +132,8 @@ class ProsodyDurationMapperService:
         if leading + trailing > remaining:
             trailing = max(0, remaining - leading)
         middle = max(0, remaining - leading - trailing)
+        samples = self._insert_middle_pause(samples, middle, sample_rate, source_prosody)
+        middle = 0
 
         padded = np.concatenate(
             [
@@ -171,6 +179,83 @@ class ProsodyDurationMapperService:
         if peak > 0.995:
             boosted = boosted / peak * 0.995
         return boosted.astype(np.float32, copy=False)
+
+    def _apply_energy_contour(self, samples, sample_rate, source_prosody):
+        contour = source_prosody.get("energy_contour_db") or []
+        if len(contour) < 3 or samples.size < max(4, int(sample_rate * 0.12)):
+            return samples
+
+        contour = np.asarray(contour, dtype=np.float32)
+        contour = contour - float(np.mean(contour))
+        contour = np.clip(contour, -7.0, 7.0)
+
+        x_src = np.linspace(0.0, 1.0, num=contour.size, dtype=np.float32)
+        x_dst = np.linspace(0.0, 1.0, num=samples.size, dtype=np.float32)
+        db_curve = np.interp(x_dst, x_src, contour).astype(np.float32)
+
+        # Keep the contour audible but not theatrical; XTTS timbre breaks if this is too aggressive.
+        strength = 0.68
+        gain = np.power(10.0, (db_curve * strength) / 20.0).astype(np.float32)
+        shaped = samples.astype(np.float32, copy=False) * gain
+        peak = float(np.max(np.abs(shaped))) if shaped.size else 0.0
+        if peak > 0.995:
+            shaped = shaped / peak * 0.995
+        return shaped.astype(np.float32, copy=False)
+
+    def _apply_pitch_expression_proxy(self, samples, sample_rate, source_prosody):
+        if samples.size < 3:
+            return samples
+
+        slope = float(source_prosody.get("pitch_slope_hz_per_sec") or 0.0)
+        pitch_range = float(source_prosody.get("pitch_range_hz") or 0.0)
+        pitch_std = float(source_prosody.get("pitch_std_hz") or 0.0)
+        expressiveness = self._clamp((pitch_range / 260.0) + (pitch_std / 160.0), 0.0, 1.0)
+        if expressiveness <= 0.04 and abs(slope) < 8.0:
+            return samples
+
+        direction = 1.0 if slope >= 0.0 else -1.0
+        tilt_amount = self._clamp(abs(slope) / 180.0 + expressiveness * 0.45, 0.0, 0.55)
+        t = np.linspace(-0.5, 0.5, num=samples.size, dtype=np.float32)
+
+        previous = np.concatenate(([samples[0]], samples[:-1])).astype(np.float32)
+        high = (samples - previous).astype(np.float32)
+        low = self._moving_average(samples, max(3, int(sample_rate * 0.006)))
+        if direction >= 0:
+            curve = (t + 0.5) * tilt_amount
+            shaped = samples + high * curve
+        else:
+            curve = (t + 0.5) * tilt_amount
+            shaped = samples * (1.0 - curve * 0.35) + low * (curve * 0.35)
+
+        peak = float(np.max(np.abs(shaped))) if shaped.size else 0.0
+        if peak > 0.995:
+            shaped = shaped / peak * 0.995
+        return shaped.astype(np.float32, copy=False)
+
+    def _insert_middle_pause(self, samples, pause_samples, sample_rate, source_prosody):
+        pause_samples = int(max(0, pause_samples))
+        if pause_samples <= 0 or samples.size < int(sample_rate * 0.35):
+            return samples
+
+        pause_positions = source_prosody.get("pause_positions") or []
+        pause_count = int(source_prosody.get("pause_count") or 0)
+        longest_pause = float(source_prosody.get("longest_pause_sec") or 0.0)
+        if pause_count <= 0 or longest_pause < 0.10:
+            return samples
+
+        max_pause = int(round(self._clamp(longest_pause, 0.08, 0.35) * sample_rate))
+        pause_samples = min(pause_samples, max_pause)
+        if pause_samples <= 0:
+            return samples
+
+        if pause_positions:
+            target_ratio = self._clamp(float(pause_positions[0]), 0.15, 0.85)
+            insert_at = int(round(target_ratio * samples.size))
+        else:
+            insert_at = self._lowest_energy_index(samples, sample_rate)
+        insert_at = int(self._clamp(insert_at, int(samples.size * 0.12), int(samples.size * 0.88)))
+        silence = np.zeros(pause_samples, dtype=np.float32)
+        return np.concatenate([samples[:insert_at], silence, samples[insert_at:]]).astype(np.float32, copy=False)
 
     def _target_leading_padding_samples(self, remaining, sample_rate, source_prosody):
         if remaining <= 0:
@@ -231,6 +316,7 @@ class ProsodyDurationMapperService:
 
         total_silence_sec = float(np.sum(silence_mask) * frame_sec)
         non_edge_runs = []
+        pause_positions = []
         for start, length in silence_runs:
             duration = length * frame_sec
             at_edge = start == 0 or (start + length) == len(silence_mask)
@@ -238,6 +324,8 @@ class ProsodyDurationMapperService:
                 continue
             if duration >= 0.08:
                 non_edge_runs.append(duration)
+                midpoint = (start + (length / 2.0)) / max(1, len(silence_mask))
+                pause_positions.append(round(float(midpoint), 4))
 
         return {
             "pause_ratio": self._clamp(total_silence_sec / max(0.05, len(samples) / float(sample_rate)), 0.0, 0.95),
@@ -245,6 +333,7 @@ class ProsodyDurationMapperService:
             "leading_silence_sec": leading,
             "trailing_silence_sec": trailing,
             "longest_pause_sec": max(non_edge_runs) if non_edge_runs else 0.0,
+            "pause_positions": pause_positions[:3],
             "total_silence_sec": total_silence_sec,
         }
 
@@ -255,6 +344,7 @@ class ProsodyDurationMapperService:
                 "pitch_range_hz": 0.0,
                 "pitch_slope_hz_per_sec": 0.0,
                 "pitch_std_hz": 0.0,
+                "pitch_contour_hz": [],
             }
 
         frame_len = max(1, int(sample_rate * 0.04))
@@ -290,6 +380,7 @@ class ProsodyDurationMapperService:
                 "pitch_range_hz": 0.0,
                 "pitch_slope_hz_per_sec": 0.0,
                 "pitch_std_hz": 0.0,
+                "pitch_contour_hz": [],
             }
 
         pitch_arr = np.asarray(pitches, dtype=np.float32)
@@ -303,7 +394,21 @@ class ProsodyDurationMapperService:
             "pitch_range_hz": float(np.max(pitch_arr) - np.min(pitch_arr)),
             "pitch_slope_hz_per_sec": slope,
             "pitch_std_hz": float(np.std(pitch_arr)),
+            "pitch_contour_hz": self._resample_series(pitch_arr, 12),
         }
+
+    def _estimate_energy_contour(self, samples, sample_rate, points=12):
+        if samples.size == 0:
+            return []
+        frame_len = max(1, int(sample_rate * 0.05))
+        hop = max(1, int(sample_rate * 0.025))
+        rms = self._frame_rms(samples, frame_len, hop)
+        if rms.size == 0:
+            return []
+        db = 20.0 * np.log10(np.maximum(rms, 1e-6))
+        db = db - float(np.mean(db))
+        db = np.clip(db, -9.0, 9.0)
+        return self._resample_series(db.astype(np.float32), points)
 
     def _frame_rms(self, samples, frame_len, hop):
         values = []
@@ -313,6 +418,37 @@ class ProsodyDurationMapperService:
                 break
             values.append(math.sqrt(float(np.mean(frame * frame) + 1e-9)))
         return np.asarray(values, dtype=np.float32)
+
+    def _lowest_energy_index(self, samples, sample_rate):
+        frame_len = max(1, int(sample_rate * 0.08))
+        hop = max(1, int(sample_rate * 0.02))
+        rms = self._frame_rms(samples, frame_len, hop)
+        if rms.size == 0:
+            return samples.size // 2
+        search_start = int(rms.size * 0.15)
+        search_end = max(search_start + 1, int(rms.size * 0.85))
+        local_idx = int(np.argmin(rms[search_start:search_end]))
+        frame_idx = search_start + local_idx
+        return min(samples.size - 1, frame_idx * hop + frame_len // 2)
+
+    def _moving_average(self, samples, window_size):
+        window_size = max(1, int(window_size))
+        if window_size <= 1:
+            return samples.astype(np.float32, copy=False)
+        kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
+        return np.convolve(samples, kernel, mode="same").astype(np.float32)
+
+    def _resample_series(self, values, points):
+        values = np.asarray(values, dtype=np.float32)
+        points = int(points)
+        if values.size == 0 or points <= 0:
+            return []
+        if values.size == 1:
+            return [round(float(values[0]), 4)] * points
+        x_src = np.linspace(0.0, 1.0, num=values.size, dtype=np.float32)
+        x_dst = np.linspace(0.0, 1.0, num=points, dtype=np.float32)
+        resampled = np.interp(x_dst, x_src, values).astype(np.float32)
+        return [round(float(value), 4) for value in resampled]
 
     def _mask_runs(self, mask):
         runs = []

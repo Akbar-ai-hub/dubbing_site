@@ -3,10 +3,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from videos.models import Video
 from videos.serializers import VideoSerializer
+from dubbing.services.ffmpeg_service import FFmpegService
 
 from .tasks import process_video_dubbing
 
@@ -56,11 +57,23 @@ class StartDubbingView(APIView):
         billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
         if billing_enabled:
             billing_currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
-            min_balance = Decimal(str(getattr(settings, "BILLING_MIN_START_BALANCE", "100.00")))
             user_balance = Decimal(str(request.user.balance))
-            if user_balance < min_balance:
+            try:
+                required_amount = self._estimate_required_balance(video)
+            except Exception as exc:
                 return Response(
-                    {"error": f"Insufficient balance. Minimum required to start dubbing is {min_balance} {billing_currency}."},
+                    {"error": f"Failed to estimate dubbing cost: {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if user_balance < required_amount:
+                return Response(
+                    {
+                        "error": (
+                            "Insufficient balance for this video. "
+                            f"Estimated dubbing cost with safety margin is {required_amount} {billing_currency}, "
+                            f"but your balance is {user_balance} {billing_currency}."
+                        )
+                    },
                     status=status.HTTP_402_PAYMENT_REQUIRED,
                 )
 
@@ -93,6 +106,40 @@ class StartDubbingView(APIView):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+
+    def _estimate_required_balance(self, video):
+        duration_sec = self._get_video_duration(video)
+        estimate_price_per_video_min = self._to_decimal(
+            getattr(settings, "DUBBING_ESTIMATE_PRICE_PER_VIDEO_MINUTE", "2000.00"),
+            "2000.00",
+        )
+        duration_minutes = Decimal(str(max(0.0, float(duration_sec)))) / Decimal("60")
+        base_cost = duration_minutes * estimate_price_per_video_min
+        safety_multiplier = Decimal("1.20")
+        return (base_cost * safety_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _get_video_duration(self, video):
+        if video.duration and float(video.duration) > 0:
+            return float(video.duration)
+
+        video_path = getattr(video.original_video, "path", None)
+        if not video_path:
+            raise RuntimeError("Video duration could not be determined.")
+
+        ffmpeg_service = FFmpegService(ffmpeg_bin=getattr(settings, "FFMPEG_BIN", "ffmpeg"))
+        duration = float(ffmpeg_service.get_duration(video_path))
+        if duration <= 0:
+            raise RuntimeError("Video duration could not be determined.")
+
+        video.duration = round(duration, 3)
+        video.save(update_fields=["duration"])
+        return duration
+
+    def _to_decimal(self, value, default="0"):
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal(str(default))
 
 
 class DubbingStatusView(APIView):

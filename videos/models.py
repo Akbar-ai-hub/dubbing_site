@@ -31,6 +31,7 @@ class Video(models.Model):
     progress_percent = models.PositiveSmallIntegerField(default=0)
     error_message = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Video #{self.id} ({self.status})"

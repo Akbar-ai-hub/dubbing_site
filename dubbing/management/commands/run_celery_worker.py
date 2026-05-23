@@ -66,6 +66,9 @@ class Command(BaseCommand):
             "--prefetch-multiplier",
             str(getattr(settings, "CELERY_WORKER_PREFETCH_MULTIPLIER", 1)),
         ]
+        max_tasks_per_child = int(getattr(settings, "CELERY_WORKER_MAX_TASKS_PER_CHILD", 0) or 0)
+        if max_tasks_per_child > 0:
+            cmd += ["--max-tasks-per-child", str(max_tasks_per_child)]
         if pool:
             cmd += ["-P", pool]
         if hostname:

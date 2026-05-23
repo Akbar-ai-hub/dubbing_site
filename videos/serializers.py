@@ -114,9 +114,12 @@ class VideoSerializer(serializers.ModelSerializer):
         )
 
     def _estimate_required_balance(self, duration_sec):
-        gpu_price_per_min = self._to_decimal(getattr(settings, "2000.00", "15.00"), "15.00")
+        estimate_price_per_video_min = self._to_decimal(
+            getattr(settings, "DUBBING_ESTIMATE_PRICE_PER_VIDEO_MINUTE", "2000.00"),
+            "2000.00",
+        )
         duration_minutes = Decimal(str(max(0.0, float(duration_sec)))) / Decimal("60")
-        base_cost = duration_minutes * gpu_price_per_min
+        base_cost = duration_minutes * estimate_price_per_video_min
         safety_multiplier = Decimal("1.20")
         return (base_cost * safety_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 

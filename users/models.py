@@ -1,6 +1,7 @@
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 
 class PasswordResetCode(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
@@ -92,12 +93,14 @@ class UserNotification(models.Model):
     TYPE_DUBBING_FAILED = "dubbing_failed"
     TYPE_BILLING = "billing"
     TYPE_SYSTEM = "system"
+    TYPE_MARKETING = "marketing"
 
     TYPE_CHOICES = [
         (TYPE_DUBBING_COMPLETED, "Dubbing Completed"),
         (TYPE_DUBBING_FAILED, "Dubbing Failed"),
         (TYPE_BILLING, "Billing"),
         (TYPE_SYSTEM, "System"),
+        (TYPE_MARKETING, "Marketing"),
     ]
 
     user = models.ForeignKey(
@@ -124,6 +127,33 @@ class UserNotification(models.Model):
 
     def __str__(self):
         return f"UserNotification(user={self.user_id}, type={self.notification_type}, read={self.is_read})"
+
+
+class MarketingMessage(models.Model):
+    subject = models.CharField(max_length=200)
+    message = models.TextField()
+    is_active = models.BooleanField(default=True)
+    sent_at = models.DateTimeField(blank=True, null=True)
+    recipients_count = models.PositiveIntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def mark_sent(self, recipients_count):
+        self.sent_at = timezone.now()
+        self.recipients_count = int(recipients_count)
+        self.last_error = ""
+        self.save(update_fields=["sent_at", "recipients_count", "last_error", "updated_at"])
+
+    def mark_failed(self, error):
+        self.last_error = str(error)
+        self.save(update_fields=["last_error", "updated_at"])
+
+    def __str__(self):
+        return self.subject
 
 
 # Create your models here.

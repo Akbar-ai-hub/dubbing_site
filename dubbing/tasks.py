@@ -2,15 +2,18 @@ import os
 import shutil
 import tempfile
 import time
+import gc
 from pathlib import Path
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 
-from celery import shared_task
+from celery import Task, shared_task
 from django.conf import settings
 from django.core.files.base import File
 from django.core.mail import send_mail
+from django.core.mail import get_connection
 from django.db import transaction
+from django.utils import timezone
 
 from videos.models import Video
 from users.models import BillingTransaction, User, NotificationPreference, UserNotification
@@ -90,7 +93,7 @@ def _bill_video_usage(user_id, gpu_seconds, video_id=None, billing_reason="compl
 
 def _update_video_progress(video_id, percent, stage=None):
     clamped = max(0, min(100, int(percent)))
-    Video.objects.filter(id=video_id).update(progress_percent=clamped)
+    Video.objects.filter(id=video_id).update(progress_percent=clamped, updated_at=timezone.now())
     if stage:
         logger.info("Dubbing progress video=%s %s%% stage=%s", video_id, clamped, stage)
 
@@ -127,13 +130,43 @@ def _create_dubbing_notification(user_id, video_id, is_success, error_message=""
                 f"{message}\n\n"
                 "Video Dubbing Service"
             )
-            send_mail(
-                subject=subject,
-                message=email_message,
-                from_email=getattr(settings, "EMAIL_HOST_USER", None),
-                recipient_list=[user.email],
-                fail_silently=True,
+            from_email = (
+                getattr(settings, "DEFAULT_FROM_EMAIL", "")
+                or getattr(settings, "EMAIL_HOST_USER", "")
+                or None
             )
+            if not from_email or not getattr(settings, "EMAIL_HOST_PASSWORD", ""):
+                logger.warning(
+                    "Email notification skipped for video=%s user=%s: EMAIL_HOST_USER/EMAIL_HOST_PASSWORD is not configured",
+                    video_id,
+                    user_id,
+                )
+                return
+
+            try:
+                sent_count = send_mail(
+                    subject=subject,
+                    message=email_message,
+                    from_email=from_email,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                    connection=get_connection(fail_silently=False),
+                )
+                logger.info(
+                    "Email notification sent for video=%s user=%s recipient=%s sent_count=%s",
+                    video_id,
+                    user_id,
+                    user.email,
+                    sent_count,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Email notification failed for video=%s user=%s recipient=%s: %s",
+                    video_id,
+                    user_id,
+                    user.email,
+                    exc,
+                )
     except Exception as exc:
         logger.warning("Failed to create user notification for video=%s: %s", video_id, exc)
 
@@ -156,10 +189,58 @@ def _cleanup_stale_subtitles(video_id, keep_name=None):
         except Exception as exc:
             logger.warning("Failed to delete stale subtitle file %s: %s", path, exc)
 
+
+def _release_runtime_resources(obj=None):
+    try:
+        if obj is not None:
+            del obj
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception as exc:
+        logger.debug("Torch CUDA cleanup skipped: %s", exc)
+
+    gc.collect()
+
+
 logger = logging.getLogger(__name__)
 
-@shared_task
-def process_video_dubbing(video_id):
+
+class DubbingTask(Task):
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        video_id = args[0] if args else kwargs.get("video_id")
+        if not video_id:
+            return
+
+        error_text = str(exc) or "Dubbing task failed"
+        try:
+            video = Video.objects.filter(id=video_id).first()
+            if not video:
+                return
+            Video.objects.filter(id=video_id).update(
+                status=Video.STATUS_FAILED,
+                progress_percent=0,
+                error_message=error_text,
+                updated_at=timezone.now(),
+            )
+            _create_dubbing_notification(
+                user_id=video.user_id,
+                video_id=video_id,
+                is_success=False,
+                error_message=error_text,
+            )
+        except Exception:
+            logger.exception("Failed to mark video=%s as failed from Celery on_failure", video_id)
+
+
+@shared_task(bind=True, base=DubbingTask)
+def process_video_dubbing(self, video_id):
     try:
         video = Video.objects.get(id=video_id)
     except Video.DoesNotExist:
@@ -185,6 +266,7 @@ def process_video_dubbing(video_id):
     billing_started = None
     billing_reason = "completed"
     result = {}
+    pipeline = None
 
     try:
         _update_video_progress(video.id, 2, "initializing")
@@ -333,10 +415,12 @@ def process_video_dubbing(video_id):
             status=Video.STATUS_FAILED,
             progress_percent=0,
             error_message=error_text,
+            updated_at=timezone.now(),
         )
         _create_dubbing_notification(user_id=user_id, video_id=video.id, is_success=False, error_message=error_text)
         return {"video_id": video.id, "status": Video.STATUS_FAILED, "error": error_text}
     finally:
+        _release_runtime_resources(pipeline)
         if billing_started is not None:
             billing_elapsed = max(0.0, time.monotonic() - billing_started)
             try:

@@ -492,6 +492,7 @@ class DubbingPipelineService:
         return f"{left} {right}"
 
     def _extract_segment_audio(self, segments, vocals_path, work_dir):
+        ref_source_path = self._prepare_reference_source(vocals_path, work_dir)
         items = []
         for idx, segment in enumerate(segments):
             start = float(segment["start"])
@@ -499,7 +500,6 @@ class DubbingPipelineService:
             duration = max(0.1, end - start)
 
             raw_ref_path = str(Path(work_dir) / f"segment_{idx:04d}_raw.wav")
-            denoised_ref_path = str(Path(work_dir) / f"segment_{idx:04d}_denoised.wav")
             ref_22050_path = str(Path(work_dir) / f"segment_{idx:04d}_ref_22050.wav")
 
             self.ffmpeg.extract_audio_segment(
@@ -508,13 +508,11 @@ class DubbingPipelineService:
                 start_sec=start,
                 end_sec=end,
             )
-            self.ffmpeg.denoise_audio(
-                input_audio_path=raw_ref_path,
-                output_audio_path=denoised_ref_path,
-            )
-            self.ffmpeg.resample_audio(
-                input_audio_path=denoised_ref_path,
+            self.ffmpeg.extract_audio_segment(
+                input_audio_path=ref_source_path,
                 output_audio_path=ref_22050_path,
+                start_sec=start,
+                end_sec=end,
                 sample_rate_hz=22050,
             )
             source_prosody = self.prosody.analyze_source_segment(
@@ -532,42 +530,97 @@ class DubbingPipelineService:
                     "char_count": int(segment.get("char_count") or 0),
                     "reference_path": ref_22050_path,
                     "source_reference_path": ref_22050_path,
+                    "segment_reference_path": ref_22050_path,
+                    "reference_duration_sec": duration,
                     "source_prosody": source_prosody,
                 }
             )
 
-        self._assign_reference_fallbacks(items)
+        self._assign_reference_audio(items, work_dir)
         return items
 
-    def _assign_reference_fallbacks(self, segment_items):
+    def _prepare_reference_source(self, vocals_path, work_dir):
+        denoised_path = str(Path(work_dir) / "reference_source_denoised.wav")
+        ref_source_path = str(Path(work_dir) / "reference_source_22050.wav")
+        self.ffmpeg.denoise_audio(
+            input_audio_path=vocals_path,
+            output_audio_path=denoised_path,
+            sample_rate_hz=22050,
+        )
+        self.ffmpeg.resample_audio(
+            input_audio_path=denoised_path,
+            output_audio_path=ref_source_path,
+            sample_rate_hz=22050,
+        )
+        return ref_source_path
+
+    def _assign_reference_audio(self, segment_items, work_dir):
         if not segment_items:
             return
-        strong_candidates = [item for item in segment_items if item["char_count"] >= self.min_chars]
+
+        self._combine_short_reference_audio(segment_items, work_dir, min_duration_sec=3.0)
+
+    def _combine_short_reference_audio(self, segment_items, work_dir, min_duration_sec=3.0):
+        min_duration_sec = float(min_duration_sec)
         for idx, item in enumerate(segment_items):
-            if item["char_count"] >= self.min_chars:
+            own_duration = float(item.get("reference_duration_sec") or 0.0)
+            if own_duration >= min_duration_sec:
                 continue
-            fallback = self._find_reference_fallback(idx, segment_items, strong_candidates)
-            if fallback:
-                item["reference_path"] = fallback["source_reference_path"]
 
-    def _find_reference_fallback(self, idx, segment_items, strong_candidates):
+            parts = self._collect_reference_parts(idx, segment_items, min_duration_sec)
+            total_duration = sum(float(part.get("reference_duration_sec") or 0.0) for part in parts)
+            if len(parts) <= 1 or total_duration < min_duration_sec:
+                logger.warning(
+                    "Reference audio for segment %s is %.3fs and no same-speaker audio can raise it to %.3fs",
+                    idx,
+                    own_duration,
+                    min_duration_sec,
+                )
+                continue
+
+            output_path = str(Path(work_dir) / f"segment_{idx:04d}_ref_combined_22050.wav")
+            ordered_parts = sorted(parts, key=lambda part: float(part["start"]))
+            self.ffmpeg.concat_audio_files(
+                [part["segment_reference_path"] for part in ordered_parts],
+                output_audio_path=output_path,
+                sample_rate_hz=22050,
+            )
+            item["reference_path"] = output_path
+            item["source_reference_path"] = output_path
+            item["reference_duration_sec"] = total_duration
+            logger.info(
+                "Combined same-speaker reference for segment %s speaker=%s duration=%.3fs parts=%s",
+                idx,
+                item.get("speaker"),
+                total_duration,
+                [segment_items.index(part) for part in ordered_parts],
+            )
+
+    def _collect_reference_parts(self, idx, segment_items, min_duration_sec):
         item = segment_items[idx]
-        same_speaker = [
-            candidate
-            for candidate in strong_candidates
-            if candidate["speaker"] == item["speaker"] and candidate["source_reference_path"] != item["source_reference_path"]
-        ]
-        pool = same_speaker or [
-            candidate for candidate in strong_candidates if candidate["source_reference_path"] != item["source_reference_path"]
-        ]
-        if not pool:
-            return None
-
         target_mid = (float(item["start"]) + float(item["end"])) / 2.0
-        return min(
-            pool,
-            key=lambda candidate: abs(((float(candidate["start"]) + float(candidate["end"])) / 2.0) - target_mid),
+        parts = [item]
+        total_duration = float(item.get("reference_duration_sec") or 0.0)
+
+        candidates = [
+            candidate
+            for candidate_idx, candidate in enumerate(segment_items)
+            if candidate_idx != idx and candidate.get("speaker") == item.get("speaker")
+        ]
+        candidates.sort(
+            key=lambda candidate: (
+                abs(((float(candidate["start"]) + float(candidate["end"])) / 2.0) - target_mid),
+                -float(candidate.get("reference_duration_sec") or 0.0),
+            )
         )
+
+        for candidate in candidates:
+            parts.append(candidate)
+            total_duration += float(candidate.get("reference_duration_sec") or 0.0)
+            if total_duration >= min_duration_sec:
+                break
+
+        return parts
 
     def _write_sidecar_srt(self, segments, translations):
         if not self.ref_audio_output_dir or not self.subtitle_basename:
