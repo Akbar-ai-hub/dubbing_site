@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
 
 logger = logging.getLogger(__name__)
@@ -191,16 +192,15 @@ class SpeakerAttributionService:
                 "pyannote.core is required for speaker attribution. Install with: pip install pyannote.core"
             ) from exc
 
+        audio_duration = self._get_audio_duration_sec(audio_path)
         embeddings = []
         for idx, seg in enumerate(segments):
             start = float(seg.get("start", 0.0))
             end = float(seg.get("end", 0.0))
-            duration = max(0.0, end - start)
-            crop_start, crop_end = start, end
-            if duration < self.min_window_sec:
-                pad = (self.min_window_sec - duration) / 2.0
-                crop_start = max(0.0, crop_start - pad)
-                crop_end = crop_end + pad
+            crop_start = max(0.0, min(start, audio_duration))
+            crop_end = max(crop_start, min(end, audio_duration))
+            if crop_end <= crop_start:
+                crop_end = min(audio_duration, crop_start + 0.05)
 
             sub_segment = Segment(crop_start, crop_end)
             emb = inference.crop(audio_path, sub_segment)
@@ -216,6 +216,13 @@ class SpeakerAttributionService:
                 seg.get("text") or "",
             )
         return np.asarray(embeddings, dtype="float32")
+
+    def _get_audio_duration_sec(self, audio_path):
+        try:
+            info = sf.info(str(audio_path))
+            return max(0.0, float(info.duration))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read speaker audio duration: {exc}") from exc
 
     def _resolve_num_speakers(self, embeddings, requested_num_speakers, segment_count):
         if requested_num_speakers is not None and int(requested_num_speakers) > 0:

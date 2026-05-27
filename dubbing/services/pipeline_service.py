@@ -3,6 +3,9 @@ import re
 import textwrap
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 from .demucs_service import DemucsService
 from .ffmpeg_service import FFmpegService
 from .prosody_service import ProsodyDurationMapperService
@@ -137,18 +140,25 @@ class DubbingPipelineService:
         self._persist_clean_vocals(vocals_path)
 
         self._emit_progress(progress_callback, 28, "transcription")
-        asr = self.whisper.transcribe(vocals_path, language=self.source_language)
+        asr = self.whisper.transcribe(extracted_audio_path, language=self.source_language)
         detected_language = asr.get("language")
-        words = self._normalize_word_timestamps(asr.get("words") or [], total_duration)
+        raw_words = asr.get("words") or []
+        raw_segments = asr.get("segments") or []
+        words = self._normalize_word_timestamps(raw_words, total_duration)
         if not words:
             raise RuntimeError("Whisper returned no usable word timestamps")
 
-        whisper_raw_segments = self._normalize_whisper_segments(asr.get("segments") or [], total_duration)
+        whisper_raw_segments = self._normalize_whisper_segments(raw_segments, total_duration)
+        leading_speech_onset_sec = self._estimate_leading_speech_onset_for_asr(
+            raw_words=raw_words,
+            vocals_path=vocals_path,
+        )
         whisper_segments = self._build_sentence_segments(
             words=words,
             total_duration=total_duration,
             vocals_path=vocals_path,
             whisper_raw_segments=whisper_raw_segments,
+            leading_speech_onset_sec=leading_speech_onset_sec,
         )
         if not whisper_segments:
             raise RuntimeError("Whisper returned no usable segments")
@@ -197,7 +207,7 @@ class DubbingPipelineService:
                 source_prosody=item.get("source_prosody"),
                 transcript_text=item.get("text") or translated,
             )
-            timeline_segments.append({"path": seg_mapped_path, "start": item["start"]})
+            timeline_segments.append({"path": seg_mapped_path, "start": float(item["start"])})
 
             tts_progress = 60 + int(((idx + 1) / total_segments) * 25)
             self._emit_progress(progress_callback, tts_progress, "tts")
@@ -243,9 +253,10 @@ class DubbingPipelineService:
         except Exception as exc:
             logger.warning("Progress callback failed at stage %s: %s", stage, exc)
 
-    def _normalize_word_timestamps(self, raw_words, total_duration):
+    def _normalize_word_timestamps(self, raw_words, total_duration, offset_sec=0.0):
         normalized = []
         total_duration = max(0.1, float(total_duration))
+        offset_sec = float(offset_sec)
         for word in raw_words:
             if not isinstance(word, dict):
                 continue
@@ -253,8 +264,8 @@ class DubbingPipelineService:
             if not text:
                 continue
             try:
-                start = max(0.0, float(word.get("start", 0.0)))
-                end = min(total_duration, float(word.get("end", 0.0)))
+                start = max(0.0, float(word.get("start", 0.0)) + offset_sec)
+                end = min(total_duration, float(word.get("end", 0.0)) + offset_sec)
             except (TypeError, ValueError):
                 continue
             if end <= start:
@@ -262,9 +273,10 @@ class DubbingPipelineService:
             normalized.append({"word": text, "start": start, "end": end})
         return normalized
 
-    def _normalize_whisper_segments(self, raw_segments, total_duration):
+    def _normalize_whisper_segments(self, raw_segments, total_duration, offset_sec=0.0):
         normalized = []
         total_duration = max(0.1, float(total_duration))
+        offset_sec = float(offset_sec)
         for idx, segment in enumerate(raw_segments):
             if not isinstance(segment, dict):
                 continue
@@ -272,8 +284,8 @@ class DubbingPipelineService:
             if not text:
                 continue
             try:
-                start = max(0.0, float(segment.get("start", 0.0)))
-                end = min(total_duration, float(segment.get("end", 0.0)))
+                start = max(0.0, float(segment.get("start", 0.0)) + offset_sec)
+                end = min(total_duration, float(segment.get("end", 0.0)) + offset_sec)
             except (TypeError, ValueError):
                 continue
             if end <= start:
@@ -281,11 +293,120 @@ class DubbingPipelineService:
             normalized.append({"id": idx, "start": start, "end": end, "text": text})
         return normalized
 
-    def _build_sentence_segments(self, words, total_duration, vocals_path, whisper_raw_segments=None):
+    def _estimate_leading_speech_onset_for_asr(self, raw_words, vocals_path):
+        asr_start = self._first_asr_timestamp(raw_words, [])
+        if asr_start is None or float(asr_start) > 0.35:
+            return 0.0
+        try:
+            speech_onset = self._estimate_first_speech_onset_sec(vocals_path)
+        except Exception as exc:
+            logger.warning("Failed to estimate leading speech onset: %s", exc)
+            return 0.0
+        if speech_onset < 1.0:
+            return 0.0
+        logger.info("Detected leading speech onset for first ASR segment: %.3f", speech_onset)
+        return float(speech_onset)
+
+    def _estimate_asr_timestamp_offset(self, raw_words, raw_segments, vocals_path):
+        asr_start = self._first_asr_timestamp(raw_words, raw_segments)
+        if asr_start is None:
+            return 0.0
+
+        try:
+            speech_onset = self._estimate_first_speech_onset_sec(vocals_path)
+        except Exception as exc:
+            logger.warning("Failed to estimate first speech onset for timestamp alignment: %s", exc)
+            return 0.0
+
+        offset = float(speech_onset) - float(asr_start)
+        if abs(offset) < 0.50:
+            logger.info(
+                "ASR timestamp offset skipped: speech_onset=%.3f asr_start=%.3f offset=%.3f",
+                speech_onset,
+                asr_start,
+                offset,
+            )
+            return 0.0
+
+        logger.info(
+            "Applying ASR timestamp offset: speech_onset=%.3f asr_start=%.3f offset=%.3f",
+            speech_onset,
+            asr_start,
+            offset,
+        )
+        return offset
+
+    def _first_asr_timestamp(self, raw_words, raw_segments):
+        starts = []
+        for item in raw_words or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                starts.append(float(item.get("start", 0.0)))
+            except (TypeError, ValueError):
+                continue
+        for item in raw_segments or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                starts.append(float(item.get("start", 0.0)))
+            except (TypeError, ValueError):
+                continue
+        starts = [value for value in starts if value >= 0.0]
+        return min(starts) if starts else None
+
+    def _estimate_first_speech_onset_sec(self, audio_path):
+        samples, sample_rate = sf.read(str(audio_path), always_2d=False)
+        if isinstance(samples, np.ndarray) and samples.ndim > 1:
+            samples = np.mean(samples, axis=1)
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if samples.size == 0:
+            return 0.0
+
+        frame_len = max(1, int(sample_rate * 0.05))
+        hop = max(1, int(sample_rate * 0.01))
+        rms_values = []
+        for start in range(0, max(1, len(samples) - frame_len + 1), hop):
+            frame = samples[start:start + frame_len]
+            if frame.size < frame_len:
+                break
+            rms_values.append(float(np.sqrt(np.mean(frame * frame) + 1e-9)))
+        if not rms_values:
+            return 0.0
+
+        rms = np.asarray(rms_values, dtype=np.float32)
+        peak = float(np.max(rms))
+        if peak <= 0.0:
+            return 0.0
+
+        threshold = max(peak * 0.10, float(np.percentile(rms, 70)) * 1.8, 5e-4)
+        frame_sec = hop / float(sample_rate)
+        consecutive_needed = max(2, int(round(0.10 / max(frame_sec, 1e-6))))
+        streak = 0
+        for idx, value in enumerate(rms):
+            if float(value) >= threshold:
+                streak += 1
+                if streak >= consecutive_needed:
+                    onset_frame = idx - streak + 1
+                    return max(0.0, onset_frame * frame_sec)
+            else:
+                streak = 0
+        return 0.0
+
+
+    def _build_sentence_segments(
+        self,
+        words,
+        total_duration,
+        vocals_path,
+        whisper_raw_segments=None,
+        leading_speech_onset_sec=0.0,
+    ):
         whisper_raw_segments = whisper_raw_segments or []
         units = []
         current = None
         sentence_end_re = re.compile(r'[.!?]["\')\]]*$')
+        leading_speech_onset_sec = max(0.0, float(leading_speech_onset_sec or 0.0))
 
         for word in words:
             item = dict(word)
@@ -330,7 +451,26 @@ class DubbingPipelineService:
                 float(segment.get("end", 0.0)),
                 segment.get("text") or "",
             )
+        if leading_speech_onset_sec > 0.0:
+            merged = self._apply_leading_speech_onset_to_first_segment(merged, leading_speech_onset_sec)
         return self._normalize_regrouped_segments(merged, total_duration)
+
+    def _apply_leading_speech_onset_to_first_segment(self, segments, leading_speech_onset_sec):
+        if not segments:
+            return segments
+        first = dict(segments[0])
+        start = float(first.get("start", 0.0))
+        end = float(first.get("end", 0.0))
+        leading_speech_onset_sec = float(leading_speech_onset_sec)
+        if start <= 0.35 and start < leading_speech_onset_sec < end:
+            logger.info(
+                "Adjusting first segment start from %.3f to leading speech onset %.3f",
+                start,
+                leading_speech_onset_sec,
+            )
+            first["start"] = leading_speech_onset_sec
+            return [first] + [dict(segment) for segment in segments[1:]]
+        return segments
 
     def _persist_clean_vocals(self, vocals_path):
         if not self.ref_audio_output_dir:
