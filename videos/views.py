@@ -9,6 +9,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from users.billing import ensure_no_debt_response
 from .models import Video, VideoFeedback
 from .serializers import VideoSerializer, VideoFeedbackSerializer, VideoFeedbackListItemSerializer
 
@@ -21,6 +22,10 @@ class VideoUploadView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
+
         file = request.FILES.get("video")
 
         if not file:
@@ -48,6 +53,10 @@ class YouTubeDownloadView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
+
         url = (request.data.get("url") or "").strip()
         if not url:
             return Response(
@@ -174,6 +183,10 @@ class VideoDetailView(APIView):
         except Video.DoesNotExist:
             return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
+
         serializer = VideoSerializer(video, context={"request": request})
         return Response(serializer.data)
 
@@ -219,6 +232,10 @@ class ShareDubbedVideoView(APIView):
             video = Video.objects.get(id=video_id, user=request.user)
         except Video.DoesNotExist:
             return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
 
         if not video.dubbed_video:
             return Response(
@@ -276,6 +293,10 @@ class DubbedVideoDownloadView(APIView):
         except Video.DoesNotExist:
             return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
+
         if not video.dubbed_video:
             return Response(
                 {"error": "Dubbed video is not available yet"},
@@ -294,6 +315,10 @@ class VideoFeedbackView(APIView):
             video = Video.objects.get(id=video_id, user=request.user)
         except Video.DoesNotExist:
             return Response({"error": "Video not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        debt_response = ensure_no_debt_response(request.user)
+        if debt_response:
+            return debt_response
 
         if video.status != Video.STATUS_COMPLETED or not video.dubbed_video:
             return Response(

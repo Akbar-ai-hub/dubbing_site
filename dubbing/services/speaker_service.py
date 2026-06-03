@@ -230,13 +230,17 @@ class SpeakerAttributionService:
         if self.default_num_speakers:
             return min(int(self.default_num_speakers), max(1, int(segment_count)))
         if segment_count <= 2:
-            return max(1, segment_count)
+            return self._resolve_small_sample_speaker_count(embeddings, segment_count)
 
         try:
             from sklearn.cluster import SpectralClustering
             from sklearn.metrics import silhouette_score
         except ImportError:
-            return min(4, segment_count)
+            return 1 if self._looks_like_single_speaker(embeddings) else min(4, segment_count)
+
+        if self._looks_like_single_speaker(embeddings):
+            logger.info("Speaker count resolved as 1 by embedding cohesion")
+            return 1
 
         max_candidates = min(6, segment_count - 1)
         best_k = 2
@@ -255,7 +259,101 @@ class SpeakerAttributionService:
             if best_score is None or score > best_score:
                 best_score = score
                 best_k = k
+
+        if best_score is None:
+            logger.info(
+                "Speaker count resolved as 1 because clustering produced no usable score: best_score=%s",
+                best_score,
+            )
+            return 1
+        if best_score < 0.12:
+            fallback = 1 if self._looks_like_single_speaker(embeddings, strict=False) else 2
+            logger.info(
+                "Speaker count resolved as %d by weak clustering evidence: best_score=%.4f",
+                fallback,
+                float(best_score),
+            )
+            return min(fallback, segment_count)
+
+        if best_k == 2 and self._two_cluster_split_is_weak(embeddings):
+            logger.info(
+                "Speaker count resolved as 1 by weak two-cluster separation: best_score=%.4f",
+                float(best_score),
+            )
+            return 1
+
+        logger.info("Speaker count resolved as %d by silhouette score %.4f", best_k, float(best_score))
         return best_k
+
+    def _resolve_small_sample_speaker_count(self, embeddings, segment_count):
+        if segment_count <= 1:
+            return 1
+        similarity = self._pairwise_cosine_values(embeddings)
+        if similarity.size == 0:
+            return 1
+        median_sim = float(np.median(similarity))
+        min_sim = float(np.min(similarity))
+        if median_sim >= 0.58 or min_sim >= 0.42:
+            logger.info(
+                "Speaker count resolved as 1 for small sample: median_sim=%.4f min_sim=%.4f",
+                median_sim,
+                min_sim,
+            )
+            return 1
+        return min(2, segment_count)
+
+    def _looks_like_single_speaker(self, embeddings, strict=True):
+        similarity = self._pairwise_cosine_values(embeddings)
+        if similarity.size == 0:
+            return True
+        median_sim = float(np.median(similarity))
+        p20_sim = float(np.percentile(similarity, 20))
+        mean_sim = float(np.mean(similarity))
+        min_sim = float(np.min(similarity))
+        logger.info(
+            "Speaker cohesion stats: mean_sim=%.4f median_sim=%.4f p20_sim=%.4f min_sim=%.4f strict=%s",
+            mean_sim,
+            median_sim,
+            p20_sim,
+            min_sim,
+            strict,
+        )
+        if strict:
+            return mean_sim >= 0.72 and median_sim >= 0.78 and p20_sim >= 0.58
+        return mean_sim >= 0.66 and median_sim >= 0.72 and p20_sim >= 0.50
+
+    def _two_cluster_split_is_weak(self, embeddings):
+        try:
+            labels = self._cluster_embeddings(embeddings, 2)
+        except Exception:
+            return False
+
+        values = []
+        for cluster_id in (0, 1):
+            points = embeddings[labels == cluster_id]
+            if len(points) == 0:
+                return True
+            centroid = self._normalize_embedding(np.mean(points, axis=0))
+            values.append(centroid)
+
+        centroid_sim = float(np.dot(values[0], values[1]))
+        sizes = [int(np.sum(labels == cluster_id)) for cluster_id in (0, 1)]
+        imbalance = min(sizes) / max(1, max(sizes))
+        logger.info(
+            "Two-cluster separation stats: centroid_sim=%.4f sizes=%s imbalance=%.4f",
+            centroid_sim,
+            sizes,
+            imbalance,
+        )
+        return centroid_sim >= 0.72 or imbalance < 0.10
+
+    def _pairwise_cosine_values(self, embeddings):
+        if embeddings is None or len(embeddings) < 2:
+            return np.asarray([], dtype="float32")
+        normalized = np.asarray([self._normalize_embedding(item) for item in embeddings], dtype="float32")
+        matrix = np.matmul(normalized, normalized.T)
+        upper = np.triu_indices(len(normalized), k=1)
+        return matrix[upper].astype("float32")
 
     def _cluster_embeddings(self, embeddings, num_speakers):
         try:

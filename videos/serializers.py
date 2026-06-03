@@ -2,7 +2,6 @@ import os
 import tempfile
 import logging
 import math
-from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.core.files import File
@@ -10,6 +9,7 @@ from rest_framework import serializers
 
 from dubbing.services.ffmpeg_service import FFmpegService
 from dubbing.services.whisper_service import WhisperService
+from users.billing import billing_enabled, debt_error_message, user_has_debt
 from .models import Video, VideoFeedback
 
 logger = logging.getLogger(__name__)
@@ -83,17 +83,16 @@ class VideoSerializer(serializers.ModelSerializer):
                 f"Unsupported content type '{content_type}'. Allowed: {allowed_values}."
             )
 
-        duration = self._probe_duration(file_obj)
-        self._validate_user_can_afford_upload(duration)
+        self._probe_duration(file_obj)
+        self._validate_user_has_no_debt()
 
         if getattr(settings, "VALIDATE_ORIGINAL_VIDEO_ENGLISH", False):
             self._validate_english_language(file_obj)
 
         return file_obj
 
-    def _validate_user_can_afford_upload(self, duration_sec):
-        billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
-        if not billing_enabled:
+    def _validate_user_has_no_debt(self):
+        if not billing_enabled():
             return
 
         request = self.context.get("request")
@@ -101,27 +100,8 @@ class VideoSerializer(serializers.ModelSerializer):
         if not user or not getattr(user, "is_authenticated", False):
             return
 
-        required_amount = self._estimate_required_balance(duration_sec)
-        user_balance = Decimal(str(getattr(user, "balance", "0")))
-        if user_balance >= required_amount:
-            return
-
-        billing_currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
-        raise serializers.ValidationError(
-            "Insufficient balance for this video. "
-            f"Estimated dubbing cost with safety margin is {required_amount} {billing_currency}, "
-            f"but your balance is {user_balance} {billing_currency}."
-        )
-
-    def _estimate_required_balance(self, duration_sec):
-        estimate_price_per_video_min = self._to_decimal(
-            getattr(settings, "DUBBING_ESTIMATE_PRICE_PER_VIDEO_MINUTE", "2000.00"),
-            "2000.00",
-        )
-        duration_minutes = Decimal(str(max(0.0, float(duration_sec)))) / Decimal("60")
-        base_cost = duration_minutes * estimate_price_per_video_min
-        safety_multiplier = Decimal("1.20")
-        return (base_cost * safety_multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if user_has_debt(user):
+            raise serializers.ValidationError(debt_error_message(user))
 
     def _probe_duration(self, file_obj):
         ffmpeg_bin = getattr(settings, "FFMPEG_BIN", "ffmpeg")
@@ -149,20 +129,16 @@ class VideoSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Video duration could not be determined.")
         return duration
 
-    def _to_decimal(self, value, default="0"):
-        try:
-            return Decimal(str(value))
-        except Exception:
-            return Decimal(str(default))
-
     def _validate_english_language(self, file_obj):
         ffmpeg_bin = getattr(settings, "FFMPEG_BIN", "ffmpeg")
         whisper_model = getattr(settings, "GROQ_ASR_MODEL", "whisper-large-v3")
         groq_api_key = getattr(settings, "GROQ_API_KEY", "")
+        whisper_local_model_dir = getattr(settings, "WHISPER_LOCAL_MODEL_DIR", "")
+        whisper_local_device = getattr(settings, "WHISPER_LOCAL_DEVICE", "")
 
-        if not groq_api_key:
+        if not groq_api_key and not whisper_local_model_dir:
             raise serializers.ValidationError(
-                "GROQ_API_KEY must be configured for English language validation."
+                "GROQ_API_KEY or WHISPER_LOCAL_MODEL_DIR must be configured for English language validation."
             )
 
         source_name = os.path.basename(getattr(file_obj, "name", "") or "upload.mp4")
@@ -182,6 +158,8 @@ class VideoSerializer(serializers.ModelSerializer):
             whisper_service = WhisperService(
                 model_name=whisper_model,
                 api_key=groq_api_key,
+                local_model_dir=(whisper_local_model_dir or None),
+                local_device=(whisper_local_device or None),
             )
             transcription = whisper_service.transcribe(audio_path)
             detected_language = (transcription.get("language") or "").strip().lower()

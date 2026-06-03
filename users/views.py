@@ -29,11 +29,12 @@ from .throttles import (
     PasswordResetVerifyThrottle,
     RegisterThrottle,
 )
+from .billing import currency_code
 from .utils import generate_reset_code, send_reset_code
 
 User = get_user_model()
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-BILLING_CURRENCY = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
+BILLING_CURRENCY = currency_code()
 
 
 def get_tokens_for_user(user):
@@ -53,6 +54,7 @@ class CurrentUserView(APIView):
             "username": user.username,
             "email": user.email,
             "balance": str(user.balance),
+            "debt": str(user.debt),
             "currency": BILLING_CURRENCY,
             "created_at": user.created_at,
         })
@@ -77,6 +79,7 @@ class ProfileUpdateView(APIView):
                     "username": request.user.username,
                     "email": request.user.email,
                     "balance": str(request.user.balance),
+                    "debt": str(request.user.debt),
                     "currency": BILLING_CURRENCY,
                 },
             },
@@ -99,6 +102,7 @@ class ProfileUpdateView(APIView):
                     "username": request.user.username,
                     "email": request.user.email,
                     "balance": str(request.user.balance),
+                    "debt": str(request.user.debt),
                     "currency": BILLING_CURRENCY,
                 },
             },
@@ -121,6 +125,7 @@ class RegisterView(APIView):
                         "username": user.username,
                         "email": user.email,
                         "balance": str(user.balance),
+                        "debt": str(user.debt),
                         "currency": BILLING_CURRENCY,
                     },
                     "tokens": tokens,
@@ -159,6 +164,7 @@ class LoginView(APIView):
                     "username": user.username,
                     "email": user.email,
                     "balance": str(user.balance),
+                    "debt": str(user.debt),
                     "currency": BILLING_CURRENCY,
                 },
                 "tokens": tokens,
@@ -199,6 +205,7 @@ class GoogleLoginView(APIView):
                     "username": user.username,
                     "email": user.email,
                     "balance": str(user.balance),
+                    "debt": str(user.debt),
                     "currency": BILLING_CURRENCY,
                 },
                 "tokens": tokens,
@@ -322,7 +329,11 @@ class WalletBalanceView(APIView):
 
     def get(self, request):
         return Response(
-            {"balance": str(request.user.balance), "currency": BILLING_CURRENCY},
+            {
+                "balance": str(request.user.balance),
+                "debt": str(request.user.debt),
+                "currency": BILLING_CURRENCY,
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -337,19 +348,29 @@ class WalletTopUpView(APIView):
 
         with transaction.atomic():
             user = User.objects.select_for_update().get(id=request.user.id)
-            user.balance = (Decimal(user.balance) + Decimal(amount)).quantize(Decimal("0.01"))
-            user.save(update_fields=["balance"])
+            top_up_amount = Decimal(amount).quantize(Decimal("0.01"))
+            current_debt = Decimal(user.debt).quantize(Decimal("0.01"))
+            debt_payment = min(top_up_amount, current_debt)
+            balance_credit = top_up_amount - debt_payment
+
+            user.debt = (current_debt - debt_payment).quantize(Decimal("0.01"))
+            user.balance = (Decimal(user.balance) + balance_credit).quantize(Decimal("0.01"))
+            user.save(update_fields=["balance", "debt"])
             BillingTransaction.objects.create(
                 user=user,
                 txn_type=BillingTransaction.TYPE_TOP_UP,
                 amount=amount,
-                description=f"Manual top-up ({BILLING_CURRENCY})",
+                description=(
+                    f"Manual top-up ({BILLING_CURRENCY}); "
+                    f"debt_paid={debt_payment}; balance_credit={balance_credit}"
+                ),
             )
 
         return Response(
             {
                 "message": "Balance topped up successfully",
                 "balance": str(user.balance),
+                "debt": str(user.debt),
                 "currency": BILLING_CURRENCY,
             },
             status=status.HTTP_200_OK,

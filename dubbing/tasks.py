@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from videos.models import Video
 from users.models import BillingTransaction, User, NotificationPreference, UserNotification
+from users.billing import billing_enabled, debt_error_message, user_has_debt
 
 from .services import DubbingPipelineService
 
@@ -33,8 +34,7 @@ def _to_decimal(value, default="0"):
 
 
 def _bill_video_usage(user_id, gpu_seconds, video_id=None, billing_reason="completed"):
-    billing_enabled = str(getattr(settings, "BILLING_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
-    if not billing_enabled:
+    if not billing_enabled():
         return Decimal("0.00")
 
     currency = str(getattr(settings, "BILLING_CURRENCY", "KZT")).upper()
@@ -69,12 +69,16 @@ def _bill_video_usage(user_id, gpu_seconds, video_id=None, billing_reason="compl
 
     with transaction.atomic():
         user = User.objects.select_for_update().get(id=user_id)
-        if Decimal(str(user.balance)) < total_cost:
-            raise RuntimeError(
-                f"Insufficient balance for billing. Required={total_cost}, available={user.balance}."
-            )
-        user.balance = (Decimal(str(user.balance)) - total_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        user.save(update_fields=["balance"])
+        current_balance = Decimal(str(user.balance))
+        current_debt = Decimal(str(user.debt))
+        if current_balance >= total_cost:
+            user.balance = (current_balance - total_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            debt_created = Decimal("0.00")
+        else:
+            debt_created = (total_cost - current_balance).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            user.balance = Decimal("0.00")
+            user.debt = (current_debt + debt_created).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        user.save(update_fields=["balance", "debt"])
         BillingTransaction.objects.create(
             user=user,
             video=video_obj,
@@ -85,7 +89,8 @@ def _bill_video_usage(user_id, gpu_seconds, video_id=None, billing_reason="compl
                 f"gpu_minutes={gpu_minutes.quantize(Decimal('0.001'))}, "
                 f"gpu_cost={gpu_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}, "
                 f"storage_gb={storage_gb.quantize(Decimal('0.0001'))}, "
-                f"storage_cost={storage_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
+                f"storage_cost={storage_cost.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}, "
+                f"debt_created={debt_created}"
             ),
         )
     return total_cost
@@ -249,6 +254,27 @@ def process_video_dubbing(self, video_id):
     if video.status not in (Video.STATUS_QUEUED, Video.STATUS_PROCESSING):
         return {"video_id": video_id, "status": "skipped", "reason": f"status={video.status}"}
 
+    try:
+        user = User.objects.get(id=video.user_id)
+    except User.DoesNotExist:
+        return {"video_id": video_id, "status": "skipped", "reason": "user_not_found"}
+
+    if billing_enabled() and user_has_debt(user):
+        error_text = debt_error_message(user)
+        Video.objects.filter(id=video.id).update(
+            status=Video.STATUS_FAILED,
+            progress_percent=0,
+            error_message=error_text,
+            updated_at=timezone.now(),
+        )
+        _create_dubbing_notification(
+            user_id=video.user_id,
+            video_id=video.id,
+            is_success=False,
+            error_message=error_text,
+        )
+        return {"video_id": video_id, "status": Video.STATUS_FAILED, "error": error_text}
+
     if video.status != Video.STATUS_PROCESSING:
         video.status = Video.STATUS_PROCESSING
         video.progress_percent = 1
@@ -274,6 +300,8 @@ def process_video_dubbing(self, video_id):
         ffmpeg_bin = _get_setting("FFMPEG_BIN", "ffmpeg")
         whisper_model = _get_setting("GROQ_ASR_MODEL", "whisper-large-v3")
         groq_api_key = _get_setting("GROQ_API_KEY", "")
+        whisper_local_model_dir = _get_setting("WHISPER_LOCAL_MODEL_DIR", "")
+        whisper_local_device = _get_setting("WHISPER_LOCAL_DEVICE", "")
         nllb_model_dir = _get_setting(
             "NLLB_MODEL_DIR",
             r"C:\Users\AKBAR\.cache\huggingface\hub\models--facebook--nllb-200-distilled-600M",
@@ -321,6 +349,8 @@ def process_video_dubbing(self, video_id):
         pipeline = DubbingPipelineService(
             ffmpeg_bin=ffmpeg_bin,
             whisper_model_name=whisper_model,
+            whisper_local_model_dir=(whisper_local_model_dir or None),
+            whisper_local_device=(whisper_local_device or None),
             translation_model_dir=nllb_model_dir,
             groq_api_key=groq_api_key,
             source_language_name=source_language_name,

@@ -14,7 +14,7 @@ from .services import send_marketing_message
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ("id", "email", "username", "balance", "is_active", "is_staff", "created_at")
+    list_display = ("id", "email", "username", "balance", "debt", "is_active", "is_staff", "created_at")
     search_fields = ("email", "username")
     list_filter = ("is_active", "is_staff")
     ordering = ("-created_at",)

@@ -24,6 +24,8 @@ class DubbingPipelineService:
         ffmpeg_bin="ffmpeg",
         whisper_model_name="whisper-large-v3",
         groq_api_key="",
+        whisper_local_model_dir=None,
+        whisper_local_device=None,
         translation_model_dir="",
         nllb_source_lang="eng_Latn",
         nllb_target_lang="kaz_Cyrl",
@@ -63,7 +65,12 @@ class DubbingPipelineService:
     ):
         self.ffmpeg = FFmpegService(ffmpeg_bin=ffmpeg_bin)
         self.demucs = DemucsService()
-        self.whisper = WhisperService(model_name=whisper_model_name, api_key=groq_api_key)
+        self.whisper = WhisperService(
+            model_name=whisper_model_name,
+            api_key=groq_api_key,
+            local_model_dir=whisper_local_model_dir,
+            local_device=whisper_local_device,
+        )
         self.translation = LocalNLLBTranslationService(
             model_dir=translation_model_dir,
             source_lang=nllb_source_lang,
@@ -138,28 +145,40 @@ class DubbingPipelineService:
             demucs_out,
         )
         self._persist_clean_vocals(vocals_path)
+        asr_audio_path = self._prepare_asr_audio(vocals_path, work_dir)
 
         self._emit_progress(progress_callback, 28, "transcription")
-        asr = self.whisper.transcribe(extracted_audio_path, language=self.source_language)
+        asr = self.whisper.transcribe(asr_audio_path, language=self.source_language)
         detected_language = asr.get("language")
         raw_words = asr.get("words") or []
         raw_segments = asr.get("segments") or []
         words = self._normalize_word_timestamps(raw_words, total_duration)
-        if not words:
-            raise RuntimeError("Whisper returned no usable word timestamps")
-
+        self._log_whisper_word_timestamps(words)
         whisper_raw_segments = self._normalize_whisper_segments(raw_segments, total_duration)
+        self.whisper.release()
+        if not words and not whisper_raw_segments:
+            raise RuntimeError("Whisper returned no usable word or segment timestamps")
         leading_speech_onset_sec = self._estimate_leading_speech_onset_for_asr(
             raw_words=raw_words,
+            raw_segments=raw_segments,
             vocals_path=vocals_path,
         )
-        whisper_segments = self._build_sentence_segments(
-            words=words,
-            total_duration=total_duration,
-            vocals_path=vocals_path,
-            whisper_raw_segments=whisper_raw_segments,
-            leading_speech_onset_sec=leading_speech_onset_sec,
-        )
+        if not words or self._word_timestamps_look_incomplete(words, asr.get("text") or "", whisper_raw_segments):
+            logger.warning("Word timestamps look incomplete; falling back to Whisper segment timestamps")
+            whisper_segments = self._build_segments_from_whisper_segments(
+                whisper_raw_segments,
+                total_duration=total_duration,
+                vocals_path=vocals_path,
+                leading_speech_onset_sec=leading_speech_onset_sec,
+            )
+        else:
+            whisper_segments = self._build_sentence_segments(
+                words=words,
+                total_duration=total_duration,
+                vocals_path=vocals_path,
+                whisper_raw_segments=whisper_raw_segments,
+                leading_speech_onset_sec=leading_speech_onset_sec,
+            )
         if not whisper_segments:
             raise RuntimeError("Whisper returned no usable segments")
 
@@ -293,19 +312,63 @@ class DubbingPipelineService:
             normalized.append({"id": idx, "start": start, "end": end, "text": text})
         return normalized
 
-    def _estimate_leading_speech_onset_for_asr(self, raw_words, vocals_path):
+    def _log_whisper_word_timestamps(self, words):
+        logger.info("Whisper returned %d word timestamps", len(words or []))
+        for idx, word in enumerate(words or []):
+            logger.info(
+                "Whisper word %04d start=%.3f end=%.3f text=%s",
+                idx,
+                float(word.get("start", 0.0)),
+                float(word.get("end", 0.0)),
+                word.get("word") or "",
+            )
+
+    def _estimate_leading_speech_onset_for_asr(self, raw_words, raw_segments, vocals_path):
         asr_start = self._first_asr_timestamp(raw_words, [])
         if asr_start is None or float(asr_start) > 0.35:
             return 0.0
+        first_segment = self._first_raw_segment(raw_segments)
         try:
             speech_onset = self._estimate_first_speech_onset_sec(vocals_path)
         except Exception as exc:
             logger.warning("Failed to estimate leading speech onset: %s", exc)
+            speech_onset = 0.0
+
+        if first_segment:
+            first_end = float(first_segment.get("end", 0.0))
+            if speech_onset >= max(0.0, first_end - 0.25):
+                fallback = self._estimate_first_segment_start_from_text(first_segment)
+                logger.info(
+                    "Ignoring unreliable leading speech onset %.3f outside first ASR segment end %.3f; fallback=%.3f",
+                    speech_onset,
+                    first_end,
+                    fallback,
+                )
+                return fallback
+
+        if speech_onset >= 1.0:
+            logger.info("Detected leading speech onset for first ASR segment: %.3f", speech_onset)
+            return float(speech_onset)
+
+        fallback = self._estimate_first_segment_start_from_text(first_segment)
+        if fallback > 0.0:
+            logger.info("Using estimated first segment start from text/duration: %.3f", fallback)
+        return fallback
+
+    def _first_raw_segment(self, raw_segments):
+        normalized = self._normalize_whisper_segments(raw_segments or [], total_duration=10**9)
+        return normalized[0] if normalized else None
+
+    def _estimate_first_segment_start_from_text(self, first_segment):
+        if not first_segment:
             return 0.0
-        if speech_onset < 1.0:
+        start = float(first_segment.get("start", 0.0))
+        end = float(first_segment.get("end", 0.0))
+        if start > 0.35 or end <= 3.0:
             return 0.0
-        logger.info("Detected leading speech onset for first ASR segment: %.3f", speech_onset)
-        return float(speech_onset)
+        word_count = max(1, self._count_text_words(first_segment.get("text") or ""))
+        estimated_spoken_duration = self._clamp(word_count * 0.45, 1.0, 4.5)
+        return max(0.0, end - estimated_spoken_duration)
 
     def _estimate_asr_timestamp_offset(self, raw_words, raw_segments, vocals_path):
         asr_start = self._first_asr_timestamp(raw_words, raw_segments)
@@ -392,6 +455,103 @@ class DubbingPipelineService:
             else:
                 streak = 0
         return 0.0
+
+    def _word_timestamps_look_incomplete(self, words, transcript_text, whisper_raw_segments):
+        word_count = len(words or [])
+        transcript_count = self._count_text_words(transcript_text)
+        segment_text_count = self._count_text_words(" ".join(segment.get("text") or "" for segment in whisper_raw_segments or []))
+        expected_count = max(transcript_count, segment_text_count)
+        max_word_duration = self._max_word_duration_sec(words)
+        max_gap = self._max_word_gap_sec(words)
+        if max_word_duration >= 2.50:
+            logger.warning(
+                "Word timestamps look unreliable: max_word_duration=%.3f",
+                max_word_duration,
+            )
+            return True
+        if max_gap >= 4.00:
+            logger.warning(
+                "Word timestamps look unreliable: max_gap=%.3f",
+                max_gap,
+            )
+            return True
+        if expected_count <= 0:
+            return False
+        coverage = word_count / float(expected_count)
+        if expected_count >= 12 and coverage < 0.82:
+            logger.warning(
+                "Word timestamp coverage is low: words=%d expected=%d coverage=%.3f",
+                word_count,
+                expected_count,
+                coverage,
+            )
+            return True
+        return False
+
+    def _max_word_duration_sec(self, words):
+        durations = [
+            max(0.0, float(word.get("end", 0.0)) - float(word.get("start", 0.0)))
+            for word in (words or [])
+        ]
+        return max(durations) if durations else 0.0
+
+    def _max_word_gap_sec(self, words):
+        if not words or len(words) < 2:
+            return 0.0
+        sorted_words = sorted(words, key=lambda item: float(item.get("start", 0.0)))
+        gaps = []
+        prev_end = float(sorted_words[0].get("end", 0.0))
+        for word in sorted_words[1:]:
+            start = float(word.get("start", 0.0))
+            gaps.append(max(0.0, start - prev_end))
+            prev_end = max(prev_end, float(word.get("end", 0.0)))
+        return max(gaps) if gaps else 0.0
+
+    def _build_segments_from_whisper_segments(
+        self,
+        whisper_raw_segments,
+        total_duration,
+        vocals_path,
+        leading_speech_onset_sec=0.0,
+    ):
+        units = []
+        for segment in whisper_raw_segments or []:
+            text = (segment.get("text") or "").strip()
+            if not text:
+                continue
+            units.append(
+                {
+                    "start": float(segment.get("start", 0.0)),
+                    "end": float(segment.get("end", 0.0)),
+                    "text": text,
+                    "words": [],
+                    "source_segment_ids": [segment.get("id")] if segment.get("id") is not None else [],
+                }
+            )
+        if leading_speech_onset_sec > 0.0:
+            units = self._apply_leading_speech_onset_to_first_segment(units, leading_speech_onset_sec)
+        speaker_labeled_units = self.speaker_attribution.assign_speakers(
+            segments=units,
+            audio_path=vocals_path,
+        )
+        merged = self._merge_short_units(speaker_labeled_units)
+        logger.info("Regrouped %d Whisper segments into %d segments", len(units), len(merged))
+        for idx, segment in enumerate(merged):
+            logger.info(
+                "Segment %d speaker=%s start=%.3f end=%.3f text=%s",
+                idx,
+                segment.get("speaker") or "SPEAKER_00",
+                float(segment.get("start", 0.0)),
+                float(segment.get("end", 0.0)),
+                segment.get("text") or "",
+            )
+        return self._normalize_regrouped_segments(merged, total_duration)
+
+    def _count_text_words(self, text):
+        return len(re.findall(r"\b[\w']+\b", text or "", flags=re.UNICODE))
+
+    def _clamp(self, value, low, high):
+        return max(float(low), min(float(high), float(value)))
 
 
     def _build_sentence_segments(
@@ -493,6 +653,16 @@ class DubbingPipelineService:
             logger.info("Clean vocals audio copied to: %s", dest)
         except Exception as exc:
             logger.warning("Failed to persist clean vocals audio %s: %s", src, exc)
+
+    def _prepare_asr_audio(self, vocals_path, work_dir):
+        asr_audio_path = str(Path(work_dir) / "asr_vocals_denoised.wav")
+        self.ffmpeg.denoise_audio(
+            input_audio_path=vocals_path,
+            output_audio_path=asr_audio_path,
+            sample_rate_hz=16000,
+        )
+        logger.info("Prepared denoised vocals for Whisper ASR: %s", asr_audio_path)
+        return asr_audio_path
 
     def _resolve_source_segment_id(self, word, whisper_raw_segments):
         if not whisper_raw_segments:
