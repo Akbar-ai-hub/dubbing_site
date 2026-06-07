@@ -14,11 +14,21 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken, TokenError
 
-from .models import BillingTransaction, PasswordResetCode, NotificationPreference, UserNotification
+from .models import (
+    BillingTransaction,
+    NotificationPreference,
+    PasswordResetCode,
+    SupportMessage,
+    SupportTicket,
+    UserNotification,
+)
 from .serializers import (
     BillingTransactionSerializer,
     NotificationPreferenceSerializer,
     RegisterSerializer,
+    SupportMessageCreateSerializer,
+    SupportTicketCreateSerializer,
+    SupportTicketSerializer,
     UserNotificationSerializer,
     WalletTopUpSerializer,
 )
@@ -441,3 +451,88 @@ class NotificationReadView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class SupportTicketListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tickets = (
+            SupportTicket.objects
+            .filter(user=request.user)
+            .prefetch_related("messages", "messages__author")
+            .order_by("-updated_at")[:50]
+        )
+        serializer = SupportTicketSerializer(tickets, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = SupportTicketCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            ticket = SupportTicket.objects.create(
+                user=request.user,
+                subject=data.get("subject") or f"Support request from {request.user.email}",
+                category=data.get("category") or SupportTicket.CATEGORY_GENERAL,
+                status=SupportTicket.STATUS_OPEN,
+            )
+            SupportMessage.objects.create(
+                ticket=ticket,
+                author=request.user,
+                role=SupportMessage.ROLE_USER,
+                message=data["message"],
+            )
+
+        ticket = (
+            SupportTicket.objects
+            .prefetch_related("messages", "messages__author")
+            .get(id=ticket.id)
+        )
+        return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_201_CREATED)
+
+
+class SupportTicketDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_ticket(self, request, ticket_id):
+        try:
+            return (
+                SupportTicket.objects
+                .prefetch_related("messages", "messages__author")
+                .get(id=ticket_id, user=request.user)
+            )
+        except SupportTicket.DoesNotExist:
+            return None
+
+    def get(self, request, ticket_id):
+        ticket = self.get_ticket(request, ticket_id)
+        if ticket is None:
+            return Response({"error": "Support ticket not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_200_OK)
+
+    def post(self, request, ticket_id):
+        ticket = self.get_ticket(request, ticket_id)
+        if ticket is None:
+            return Response({"error": "Support ticket not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = SupportMessageCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        update_fields = ["updated_at"]
+        with transaction.atomic():
+            if ticket.status == SupportTicket.STATUS_RESOLVED:
+                ticket.status = SupportTicket.STATUS_OPEN
+                update_fields.append("status")
+            ticket.save(update_fields=update_fields)
+            SupportMessage.objects.create(
+                ticket=ticket,
+                author=request.user,
+                role=SupportMessage.ROLE_USER,
+                message=serializer.validated_data["message"],
+            )
+
+        ticket = self.get_ticket(request, ticket_id)
+        return Response(SupportTicketSerializer(ticket).data, status=status.HTTP_200_OK)

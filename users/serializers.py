@@ -3,7 +3,14 @@ from decimal import Decimal
 
 from django.conf import settings
 from rest_framework import serializers
-from .models import User, BillingTransaction, NotificationPreference, UserNotification
+from .models import (
+    BillingTransaction,
+    NotificationPreference,
+    SupportMessage,
+    SupportTicket,
+    User,
+    UserNotification,
+)
 from django.contrib.auth.password_validation import validate_password
 from django.utils.html import strip_tags
 
@@ -93,3 +100,65 @@ class UserNotificationSerializer(serializers.ModelSerializer):
             "is_read",
             "created_at",
         ]
+
+
+class SupportMessageSerializer(serializers.ModelSerializer):
+    author_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupportMessage
+        fields = ["id", "role", "message", "author_name", "created_at"]
+
+    def get_author_name(self, obj):
+        if obj.role == SupportMessage.ROLE_ADMIN:
+            return "Admin"
+        if obj.author:
+            return obj.author.username or obj.author.email
+        return "User"
+
+
+class SupportTicketSerializer(serializers.ModelSerializer):
+    messages = SupportMessageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SupportTicket
+        fields = [
+            "id",
+            "subject",
+            "category",
+            "status",
+            "messages",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class SupportTicketCreateSerializer(serializers.Serializer):
+    subject = serializers.CharField(max_length=200, allow_blank=True, required=False)
+    category = serializers.ChoiceField(
+        choices=SupportTicket.CATEGORY_CHOICES,
+        default=SupportTicket.CATEGORY_GENERAL,
+    )
+    message = serializers.CharField(min_length=2, max_length=5000)
+
+    def validate_subject(self, value):
+        clean_value = (value or "").strip()
+        if strip_tags(clean_value) != clean_value:
+            raise serializers.ValidationError("Subject must not contain HTML or script content.")
+        return clean_value
+
+    def validate_message(self, value):
+        clean_value = (value or "").strip()
+        if strip_tags(clean_value) != clean_value:
+            raise serializers.ValidationError("Message must not contain HTML or script content.")
+        return clean_value
+
+
+class SupportMessageCreateSerializer(serializers.Serializer):
+    message = serializers.CharField(min_length=2, max_length=5000)
+
+    def validate_message(self, value):
+        clean_value = (value or "").strip()
+        if strip_tags(clean_value) != clean_value:
+            raise serializers.ValidationError("Message must not contain HTML or script content.")
+        return clean_value

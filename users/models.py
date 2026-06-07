@@ -157,4 +157,77 @@ class MarketingMessage(models.Model):
         return self.subject
 
 
+class SupportTicket(models.Model):
+    STATUS_OPEN = "open"
+    STATUS_PENDING = "pending"
+    STATUS_RESOLVED = "resolved"
+
+    STATUS_CHOICES = [
+        (STATUS_OPEN, "Open"),
+        (STATUS_PENDING, "Pending"),
+        (STATUS_RESOLVED, "Resolved"),
+    ]
+
+    CATEGORY_GENERAL = "general"
+    CATEGORY_ACCOUNT = "account"
+    CATEGORY_PROCESSING = "processing"
+    CATEGORY_TECHNICAL = "technical"
+
+    CATEGORY_CHOICES = [
+        (CATEGORY_GENERAL, "General"),
+        (CATEGORY_ACCOUNT, "Account"),
+        (CATEGORY_PROCESSING, "Processing"),
+        (CATEGORY_TECHNICAL, "Technical"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="support_tickets",
+    )
+    subject = models.CharField(max_length=200)
+    category = models.CharField(max_length=32, choices=CATEGORY_CHOICES, default=CATEGORY_GENERAL)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_OPEN)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"{self.subject} ({self.user.email})"
+
+
+class SupportMessage(models.Model):
+    ROLE_USER = "user"
+    ROLE_ADMIN = "admin"
+
+    ROLE_CHOICES = [
+        (ROLE_USER, "User"),
+        (ROLE_ADMIN, "Admin"),
+    ]
+
+    ticket = models.ForeignKey(
+        SupportTicket,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="support_messages",
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=ROLE_USER)
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"SupportMessage(ticket={self.ticket_id}, role={self.role})"
+
+
 # Create your models here.

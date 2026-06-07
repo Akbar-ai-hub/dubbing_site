@@ -6,6 +6,8 @@ from .models import (
     MarketingMessage,
     NotificationPreference,
     PasswordResetCode,
+    SupportMessage,
+    SupportTicket,
     User,
     UserNotification,
 )
@@ -75,3 +77,52 @@ class BillingTransactionAdmin(admin.ModelAdmin):
 class PasswordResetCodeAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "code", "created_at")
     search_fields = ("user__email", "code")
+
+
+class SupportMessageInline(admin.TabularInline):
+    model = SupportMessage
+    extra = 1
+    fields = ("role", "author", "message", "created_at")
+    readonly_fields = ("created_at",)
+
+
+@admin.register(SupportTicket)
+class SupportTicketAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "subject", "category", "status", "updated_at")
+    list_filter = ("status", "category")
+    search_fields = ("user__email", "user__username", "subject", "messages__message")
+    readonly_fields = ("created_at", "updated_at")
+    inlines = [SupportMessageInline]
+
+    def save_formset(self, request, form, formset, change):
+        instances = formset.save(commit=False)
+        for deleted in formset.deleted_objects:
+            deleted.delete()
+        for instance in instances:
+            if isinstance(instance, SupportMessage) and instance.pk is None and request.user.is_staff:
+                instance.role = SupportMessage.ROLE_ADMIN
+            if isinstance(instance, SupportMessage) and instance.author_id is None:
+                if instance.role == SupportMessage.ROLE_ADMIN:
+                    instance.author = request.user
+                else:
+                    instance.author = form.instance.user
+            instance.save()
+            if isinstance(instance, SupportMessage):
+                instance.ticket.save(update_fields=["updated_at"])
+        formset.save_m2m()
+
+
+@admin.register(SupportMessage)
+class SupportMessageAdmin(admin.ModelAdmin):
+    list_display = ("id", "ticket", "role", "author", "message_preview", "created_at")
+    list_filter = ("role",)
+    search_fields = ("ticket__subject", "ticket__user__email", "message")
+    readonly_fields = ("created_at",)
+
+    def message_preview(self, obj):
+        message = (obj.message or "").strip()
+        if len(message) <= 80:
+            return message
+        return f"{message[:80]}..."
+
+    message_preview.short_description = "Message"

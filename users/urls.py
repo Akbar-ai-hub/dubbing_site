@@ -1,6 +1,8 @@
 from django.urls import path
 from .views import (
     RegisterView,
+    SupportTicketDetailView,
+    SupportTicketListCreateView,
     GoogleLoginView,
     CurrentUserView,
     ProfileUpdateView,
@@ -33,4 +35,6 @@ urlpatterns = [
     path('profile/notifications/', NotificationPreferenceView.as_view(), name='notification-preferences'),
     path('notifications/', NotificationListView.as_view(), name='notifications-list'),
     path('notifications/read/', NotificationReadView.as_view(), name='notifications-read'),
+    path('support/tickets/', SupportTicketListCreateView.as_view(), name='support-tickets'),
+    path('support/tickets/<int:ticket_id>/', SupportTicketDetailView.as_view(), name='support-ticket-detail'),
 ]
